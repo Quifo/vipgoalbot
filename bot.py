@@ -22,29 +22,32 @@ GIST_HEADERS = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application
 LIVE_URL = "https://www.sofascore.com/api/v1/sport/football/events/live"
 STATS_URL = "https://www.sofascore.com/api/v1/event/{}/statistics"
 
-# AI Rate Limiter (429 önleme)
+# ====================== GLOBAL AI RATE LIMITER ======================
 last_ai_requests = []
 MAX_AI_REQUESTS_PER_MINUTE = 8
+
 
 # ====================== GELİŞMİŞ AI ANALİZİ ======================
 async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
     if not GEMINI_KEY:
-        print("⚠️ GEMINI_KEY bulunamadı, varsayılan yorum kullanılıyor.")
+        print("⚠️ GEMINI_KEY bulunamadı.")
         return "AI analizi şu anda kullanılamıyor."
 
-    # Rate Limiter Kontrolü
+    # Rate Limiter
     global last_ai_requests
     now = time.time()
     last_ai_requests = [t for t in last_ai_requests if now - t < 60]
     
     if len(last_ai_requests) >= MAX_AI_REQUESTS_PER_MINUTE:
-        print("⚠️ AI Rate limit aşıldı, varsayılan yanıt veriliyor.")
+        print("⚠️ AI rate limit aşıldı, varsayılan yanıt.")
         return f"{home} takımının isabetli şut ve baskı üstünlüğü gol beklentisini artırıyor."
 
     last_ai_requests.append(now)
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
-    
+    # === EN STABİL ÇALIŞAN MODEL ===
+    model_name = "gemini-1.5-flash-latest"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
+
     prompt_text = (
         f"Sen bir profesyonel bahis analistisin. Şu maçı kısaca analiz et:\n"
         f"Maç: {home} vs {away}\n"
@@ -59,48 +62,52 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
         f"KURALLAR:\n"
         f"- Maksimum 2 cümle yaz\n"
         f"- Neden bu bahis mantıklı açıkla\n"
-        f"- Yıldız, alt çizgi, ` gibi özel karakter KULLANMA\n"
-        f"- Banko, kesin gibi kelimeler KULLANMA\n"
-        f"- Sadece veri bazlı teknik yorum yap"
+        f"- Özel karakter kullanma (* _ ` gibi)\n"
+        f"- Banko, kesin gibi kelimeler kullanma\n"
+        f"- Sadece veri bazlı yorum yap"
     )
 
     payload = {
         "contents": [{"parts": [{"text": prompt_text}]}],
         "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 150,
+            "temperature": 0.75,
+            "maxOutputTokens": 160,
         }
     }
 
-    for attempt in range(3):  # 3 deneme
+    for attempt in range(3):
         try:
-            async with httpx.AsyncClient(timeout=12.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 r = await client.post(url, json=payload)
                 
-                if r.status_code == 200:
-                    data = r.json()
-                    comment = data['candidates'][0]['content']['parts'][0]['text']
-                    clean = comment.replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '').strip()
-                    print(f"🧠 AI Yanıtı: {clean[:60]}...")
-                    return clean
+                # Hata ayıklama için detaylı log
+                if r.status_code != 200:
+                    print(f"⚠️ Gemini API Hatası: {r.status_code} | Attempt {attempt+1}")
+                    print(f"Response: {r.text[:300]}")   # ← Bu satır çok önemli!
+                    
+                    if r.status_code == 429:
+                        await asyncio.sleep(10 * (attempt + 1))
+                        continue
+                    elif r.status_code == 404:
+                        print(f"❌ Model '{model_name}' bulunamadı. Model adı hatalı.")
+                        break
+                    else:
+                        await asyncio.sleep(5)
+                        continue
 
-                elif r.status_code == 429:
-                    wait = 8 * (attempt + 1)
-                    print(f"⚠️ Rate limit ({attempt+1}/3) - {wait} saniye bekleniyor...")
-                    await asyncio.sleep(wait)
-                    continue
-
-                else:
-                    print(f"⚠️ Gemini API Hatası: {r.status_code}")
-                    await asyncio.sleep(4)
-                    continue
+                # Başarılı yanıt
+                data = r.json()
+                comment = data['candidates'][0]['content']['parts'][0]['text']
+                clean = comment.replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '').strip()
+                
+                print(f"🧠 AI Yanıtı: {clean[:70]}...")
+                return clean
 
         except Exception as e:
-            print(f"⚠️ AI Hatası (attempt {attempt+1}): {e}")
-            await asyncio.sleep(5)
+            print(f"⚠️ AI Bağlantı Hatası (attempt {attempt+1}): {e}")
+            await asyncio.sleep(6)
 
-    # Tüm denemeler başarısızsa
-    print("⚠️ AI tüm denemelerde başarısız oldu, varsayılan yanıt veriliyor.")
+    print("⚠️ AI tüm denemelerde başarısız oldu.")
     return f"{home} takımının isabetli şut oranı ve baskı puanı gol olasılığını artırıyor."
 
 
