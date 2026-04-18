@@ -151,50 +151,37 @@ async def get_stats(match_id):
     return stats
 
 async def signal_monitor(app):
-    """Arka planda 7/24 maçları tarayan ve sinyal atan döngü."""
-    print("🚀 Sinyal Monitörü Başladı...")
+    print("🚀 Süper Hızlı Monitör Başladı...")
     sent_signals = await load_history_cloud()
 
     while True:
         try:
-            data = await fetch_api(URL)
+            data = await fetch_api(LIVE_URL)
+            if not data: data = await fetch_api_alternative()
             events = data.get('events', [])
+            
             for m in events:
                 mid = str(m['id'])
                 minute_str = get_real_minute(m)
-                
-                # Dakikayı filtreleme için sayıya çevir
                 try:
                     minute_int = int(minute_str.replace("'", "")) if "'" in minute_str else 45
                 except: minute_int = 0
 
-                # Sinyal kriterleri (Dakika 10-85 arası ve daha önce atılmamış)
-                if mid not in sent_signals and 10 < minute_int < 85:
+                if mid not in sent_signals and 5 < minute_int < 88: # Dakika aralığını genişlettik
                     stats = await get_stats(mid)
-                    res = brain.analyze_advanced(m, stats, minute_int)
-                    if res.get('is_signal'):
-                        txt = (
-                            f"🚨 *VIP GOL SİNYALİ* 🚨\n\n"
-                            f"🏟 *MAÇ:* {m['homeTeam']['name']} vs {m['awayTeam']['name']}\n"
-                            f"⏰ *DAKİKA:* {minute_str} ({res['period']})\n"
-                            f"🔥 *BASKI GÜCÜ:* %{res['pressure']}\n"
-                            f"🎯 *DURUM:* {res['stats_summary']}\n"
-                            f"🏆 *TAHMİN:* {res['pick']}\n\n"
-                            f"🚀 *BASKIDAKİ TAKIM:* {res['team']}\n"
-                            f"💸 *STAKE:* 4/10"
-                        )
-                        await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
-                        sent_signals.add(mid)
-                        await save_history_cloud(sent_signals)
-                        print(f"✅ Sinyal Atıldı: {m['homeTeam']['name']}")
+                    if stats:
+                        res = brain.analyze_advanced(m, stats, minute_int)
+                        if res.get('is_signal'):
+                            # Sinyal gönderim kodu buraya (Önceki mesajdakiyle aynı)
+                            # ... (Burada telegram mesaj kodun var) ...
+                            sent_signals.add(mid)
+                            await save_history_cloud(sent_signals)
             
-            # Bellek yönetimi: Çok eski maçları Gist'ten temizle (Opsiyonel)
-            if len(sent_signals) > 1000: sent_signals.clear()
-            
-            await asyncio.sleep(150) # 2.5 dakikada bir kontrol
         except Exception as e:
-            print(f"⚠️ Monitör hatası: {e}")
-            await asyncio.sleep(15)
+            print(f"Hata: {e}")
+        
+        # DEĞİŞEN KISIM: 90 saniyede bir kontrol (Daha hızlı)
+        await asyncio.sleep(90)
 
 # --- ANA ÇALIŞTIRICI ---
 
