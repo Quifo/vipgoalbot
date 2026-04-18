@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Railway Variables
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -15,10 +14,7 @@ GIST_ID = os.getenv("GIST_ID")
 
 brain = BettingBrain()
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-GIST_HEADERS = {
-    "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github.v3+json"
-}
+GIST_HEADERS = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
 
 # --- YARDIMCI FONKSİYONLAR ---
 
@@ -30,12 +26,39 @@ async def fetch_api(url):
         except: return {}
 
 def get_min(m):
-    st = m.get('status', {})
-    if st.get('description') == 'HT': return "İY"
-    elapsed = st.get('elapsed')
-    return f"{elapsed}'" if elapsed else "1'"
+    """
+    SofaScore Dakika Bug'ını Çözen Kesin Yöntem.
+    Saniyeyi alıp 60'a böler ve futbol dakikasına çevirir.
+    """
+    status = m.get('status', {})
+    match_time = m.get('time', {}) # SofaScore asıl dakikayı burada tutar
+    
+    # 1. Devre arası kontrolü
+    if status.get('description') == 'HT':
+        return "İY"
+    
+    # 2. SofaScore 'current' saniye verisi (En garantisi budur)
+    # Bu değer maç başladığından beri akan saniyedir.
+    current_seconds = match_time.get('current')
+    
+    if current_seconds is not None and current_seconds > 0:
+        # Saniyeyi dakikaya çevir (Örn: 130 saniye // 60 = 2. dakika)
+        # Futbolda 0-59 saniye arası 1. dakika kabul edildiği için +1 ekliyoruz.
+        minute = (current_seconds // 60) + 1
+        
+        # İkinci yarı başladıysa SofaScore saniyeyi sıfırlamaz, kümülatif sayar.
+        # Eğer saniye 2700'den (45. dk) fazlaysa ve hala 1. yarı görünüyorsa 45+ yazdırabiliriz.
+        return f"{minute}'"
 
-# --- BULUT HAFIZA SİSTEMİ ---
+    # 3. Eğer saniye verisi yoksa 'elapsed' verisine güven (Fallback)
+    elapsed = status.get('elapsed')
+    if elapsed is not None and elapsed > 0:
+        return f"{elapsed}'"
+    
+    # 4. Maç henüz başlamış veya veri henüz düşmemişse
+    return "1'"
+
+# --- BULUT HAFIZA (GIST) ---
 
 async def load_history_cloud():
     url = f"https://api.github.com/gists/{GIST_ID}"
@@ -44,29 +67,19 @@ async def load_history_cloud():
             r = await client.get(url, headers=GIST_HEADERS)
             if r.status_code == 200:
                 files = r.json().get('files', {})
-                # Dosya adını burada kontrol ediyoruz
-                file_data = files.get('sent_signals.json', {})
-                content = file_data.get('content', '[]')
+                content = files.get('sent_signals.json', {}).get('content', '[]')
                 return set(json.loads(content))
-            else:
-                print(f"❌ Gist Hatası: {r.status_code}")
-                return set()
-        except Exception as e:
-            print(f"⚠️ Hafıza yüklenemedi: {e}")
             return set()
+        except: return set()
 
 async def save_history_cloud(sent_set):
     url = f"https://api.github.com/gists/{GIST_ID}"
     data = {"files": {"sent_signals.json": {"content": json.dumps(list(sent_set))}}}
     async with httpx.AsyncClient() as client:
-        try:
-            await client.patch(url, headers=GIST_HEADERS, json=data)
-        except: print("⚠️ Bulut kaydı başarısız.")
+        try: await client.patch(url, headers=GIST_HEADERS, json=data)
+        except: pass
 
 # --- KOMUTLAR ---
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 *VIP Bahis Algoritması Aktif!*\n\n/canli - Maçları listeler", parse_mode=ParseMode.MARKDOWN)
 
 async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_chat_action("typing")
@@ -88,7 +101,7 @@ async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-# --- SİNYAL MONİTÖRÜ ---
+# --- ANALİZ DÖNGÜSÜ ---
 
 async def get_stats(match_id):
     url = f"https://api.sofascore.com/api/v1/event/{match_id}/statistics"
@@ -105,53 +118,42 @@ async def get_stats(match_id):
     return stats
 
 async def signal_monitor(app):
-    print("🚀 Sinyal Monitörü Başladı...")
     sent_signals = await load_history_cloud()
-
     while True:
         data = await fetch_api("https://api.sofascore.com/api/v1/sport/football/events/live")
         events = data.get('events', [])
-        
         for m in events:
             mid = str(m['id'])
-            minute = m.get('status', {}).get('elapsed', 0)
-            
+            # Dakika bilgisini burada sayısal alıyoruz
+            m_min_str = get_min(m)
+            try:
+                # '42'' -> 42 (integer çevrimi)
+                minute = int(m_min_str.replace("'", "")) if m_min_str not in ["İY", "MS", "Canlı"] else 45
+            except: minute = 0
+
             if mid not in sent_signals and 10 < minute < 85:
                 stats = await get_stats(mid)
                 res = brain.analyze_advanced(m, stats, minute)
-                
                 if res['is_signal']:
                     txt = (
                         f"🚨 *VIP GOL SİNYALİ* 🚨\n\n"
                         f"🏟 *MAÇ:* {m['homeTeam']['name']} vs {m['awayTeam']['name']}\n"
-                        f"⏰ *DAKİKA:* {minute}' ({res['period']})\n"
+                        f"⏰ *DAKİKA:* {m_min_str} ({res['period']})\n"
                         f"🔥 *BASKI GÜCÜ:* %{res['pressure']}\n"
                         f"🎯 *DURUM:* {res['stats_summary']}\n"
-                        f"🏆 *TAHMİN:* {res['pick']}\n\n"
+                        f"🏆 *TAHMİN:* {res['pick']}\n"
                         f"🚀 *BASKIDAKİ TAKIM:* {res['team']}\n"
                         f"💸 *STAKE:* 4/10"
                     )
                     try:
                         await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
-                        sent_signals.add(mid)
-                        await save_history_cloud(sent_signals)
+                        sent_signals.add(mid); await save_history_cloud(sent_signals)
                     except: pass
-        
-        if len(sent_signals) > 1000: sent_signals.clear()
         await asyncio.sleep(150)
 
-# --- ANA ÇALIŞTIRICI ---
-
-async def post_init(application):
-    asyncio.create_task(signal_monitor(application))
+async def post_init(app): asyncio.create_task(signal_monitor(app))
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-
-    # KOMUTLARI BURAYA EKLEDİK (Artık çalışacak)
-    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("canli", live_command))
-    app.add_handler(CommandHandler("live", live_command))
-
-    print("✅ Bot ve Monitör Hazır!")
     app.run_polling()
