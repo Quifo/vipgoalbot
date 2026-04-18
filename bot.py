@@ -82,20 +82,38 @@ async def save_history_cloud(sent_set):
 # --- İSTATİSTİK ÇEKME ---
 
 async def get_stats(match_id):
+    """SofaScore'un gerçekten tuttuğu istatistikleri çeker"""
     url = STATS_URL.format(match_id)
     data = await fetch_api(url)
-    stats = {'home_sot': 0, 'away_sot': 0, 'home_da': 0, 'away_da': 0, 'has_data': False}
+    stats = {
+        'home_sot': 0, 'away_sot': 0,
+        'home_shots': 0, 'away_shots': 0,
+        'home_corners': 0, 'away_corners': 0,
+        'home_poss': 50, 'away_poss': 50,
+        'has_data': False
+    }
     try:
         for p in data.get('statistics', []):
             if p.get('period') == 'ALL':
                 for g in p.get('groups', []):
                     for i in g.get('statisticsItems', []):
-                        if i['name'] == 'Shots on target':
-                            stats['home_sot'] = int(i['homeValue']); stats['away_sot'] = int(i['awayValue'])
+                        name = i.get('name', '')
+                        try:
+                            h_val = int(str(i.get('homeValue', 0)).replace('%', ''))
+                            a_val = int(str(i.get('awayValue', 0)).replace('%', ''))
+                        except: 
+                            h_val, a_val = 0, 0
+                        
+                        if name == 'Shots on target':
+                            stats['home_sot'] = h_val; stats['away_sot'] = a_val
                             stats['has_data'] = True
-                        if i['name'] == 'Dangerous attacks':
-                            stats['home_da'] = int(i['homeValue']); stats['away_da'] = int(i['awayValue'])
+                        elif name == 'Total shots':
+                            stats['home_shots'] = h_val; stats['away_shots'] = a_val
                             stats['has_data'] = True
+                        elif name == 'Corner kicks':
+                            stats['home_corners'] = h_val; stats['away_corners'] = a_val
+                        elif name == 'Ball possession':
+                            stats['home_poss'] = h_val; stats['away_poss'] = a_val
     except: pass
     return stats if stats['has_data'] else None
 
@@ -148,23 +166,55 @@ async def signal_monitor(app):
                     if stats:
                         res = brain.analyze_advanced(m, stats, minute_int)
                         if res.get('is_signal'):
+                            
+                            # Lig bilgisi
+                            league = m.get('tournament', {}).get('name', 'Bilinmiyor')
+                            home = m['homeTeam']['name']
+                            away = m['awayTeam']['name']
+                            sh = m.get('homeScore', {}).get('current', 0)
+                            sa = m.get('awayScore', {}).get('current', 0)
+                            
+                            # Baskı barı oluştur (görsel)
+                            bar_count = res['pressure'] // 10
+                            pressure_bar = "🟩" * bar_count + "⬜" * (10 - bar_count)
+                            
                             txt = (
-                                f"🚨 *VIP GOL SİNYALİ* 🚨\n\n"
-                                f"🏟 *MAÇ:* {m['homeTeam']['name']} vs {m['awayTeam']['name']}\n"
-                                f"⏰ *DAKİKA:* {minute_str} ({res['period']})\n"
-                                f"🔥 *BASKI GÜCÜ:* %{res['pressure']}\n"
-                                f"🎯 *DURUM:* {res['stats_summary']}\n"
-                                f"🏆 *TAHMİN:* {res['pick']}\n\n"
-                                f"🚀 *BASKIDAKİ TAKIM:* {res['team']}\n"
-                                f"💸 *STAKE:* 4/10"
+                                f"╔══════════════════╗\n"
+                                f"   🚨 *VIP GOL SİNYALİ* 🚨\n"
+                                f"╚══════════════════╝\n\n"
+                                f"⚽ *{home}* `{sh} - {sa}` *{away}*\n"
+                                f"🏆 _{league}_\n\n"
+                                f"━━━━━━━━━━━━━━━━━━\n"
+                                f"⏱ *Dakika:* `{minute_str}` ({res['period']})\n"
+                                f"🎯 *Tahmin:* `{res['pick']}`\n"
+                                f"📊 *Güven:* {res['confidence']}\n"
+                                f"⚠️ *Risk:* {res['risk']}\n"
+                                f"━━━━━━━━━━━━━━━━━━\n\n"
+                                f"🔥 *BASKI ANALİZİ*\n"
+                                f"{pressure_bar} `%{res['pressure']}`\n"
+                                f"🚀 *Baskı Yapan:* {res['team']}\n\n"
+                                f"📈 *MAÇ İSTATİSTİKLERİ*\n"
+                                f"┌─────────────────\n"
+                                f"│ 🥅 İsabetli Şut: `{stats['home_sot']} - {stats['away_sot']}`\n"
+                                f"│ ⚡ Toplam Şut: `{stats['home_shots']} - {stats['away_shots']}`\n"
+                                f"│ 🚩 Korner: `{stats['home_corners']} - {stats['away_corners']}`\n"
+                                f"│ 🎮 Hakimiyet: `%{stats['home_poss']} - %{stats['away_poss']}`\n"
+                                f"└─────────────────\n\n"
+                                f"💎 _ROI Odaklı VIP Analiz_\n"
+                                f"⏰ {time.strftime('%H:%M')}"
                             )
-                            await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
+                            
+                            await app.bot.send_message(
+                                chat_id=CHAT_ID, 
+                                text=txt, 
+                                parse_mode=ParseMode.MARKDOWN
+                            )
                             sent_signals.add(mid)
                             await save_history_cloud(sent_signals)
-                            print(f"✅ Sinyal Atıldı: {m['homeTeam']['name']}")
-        except Exception as e: print(f"Döngü hatası: {e}")
-        
-        await asyncio.sleep(90) # 90 saniyede bir hızlı kontrol
+                            print(f"✅ Sinyal: {home} vs {away}")
+        except Exception as e: 
+            print(f"Döngü hatası: {e}")
+        await asyncio.sleep(90)
 
 # --- BAŞLATICI ---
 async def post_init(application):
