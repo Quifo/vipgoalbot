@@ -1,4 +1,4 @@
-import os, asyncio, httpx
+import os, asyncio, httpx, json
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -12,60 +12,68 @@ CHAT_ID = os.getenv("CHAT_ID")
 brain = BettingBrain()
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+HISTORY_FILE = "sent_signals.json"
+
+# --- HAFIZA YÖNETİMİ ---
+
+def load_history():
+    """Gönderilen sinyalleri dosyadan yükler."""
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r") as f:
+            try:
+                return set(json.load(f))
+            except:
+                return set()
+    return set()
+
+def save_history(sent_set):
+    """Gönderilen sinyalleri dosyaya kaydeder."""
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(list(sent_set), f)
+
+# --- API VE DAKİKA FONKSİYONLARI ---
 
 async def fetch_api(url):
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=25.0) as client:
         try:
             r = await client.get(url, headers=HEADERS)
             return r.json() if r.status_code == 200 else {}
         except: return {}
 
 async def get_stats(match_id):
-    """Maçın detaylı şut ve atak verilerini çeker."""
+    """İstatistikleri çeker."""
     data = await fetch_api(f"https://api.sofascore.com/api/v1/event/{match_id}/statistics")
     stats = {'home_sot': 0, 'away_sot': 0, 'home_da': 0, 'away_da': 0}
     
     for period in data.get('statistics', []):
-        if period['period'] == 'ALL':
-            for item in period['groups']:
-                for s in item['statisticsItems']:
-                    if s['name'] == 'Shots on target':
-                        stats['home_sot'] = int(s['homeValue']); stats['away_sot'] = int(s['awayValue'])
-                    if s['name'] == 'Dangerous attacks':
-                        stats['home_da'] = int(s['homeValue']); stats['away_da'] = int(s['awayValue'])
+        if period.get('period') == 'ALL':
+            for group in period.get('groups', []):
+                for item in group.get('statisticsItems', []):
+                    if item['name'] == 'Shots on target':
+                        stats['home_sot'] = int(item['homeValue']); stats['away_sot'] = int(item['awayValue'])
+                    if item['name'] == 'Dangerous attacks':
+                        stats['home_da'] = int(item['homeValue']); stats['away_da'] = int(item['awayValue'])
     return stats
 
-def get_min(m):
-    """SofaScore dakika bug'ını çözen fonksiyon."""
-    st = m.get('status', {})
-    if st.get('description') == 'HT': return "İY"
-    # elapsed 0 ise SofaScore'un start timestamp'inden hesapla (opsiyonel)
-    elapsed = st.get('elapsed')
-    return f"{elapsed}'" if elapsed else "1'"
-
-async def live_command(update, context):
-    data = await fetch_api("https://api.sofascore.com/api/v1/sport/football/events/live")
-    events = data.get('events', [])
-    if not events: await update.message.reply_text("Canlı maç yok."); return
-
-    msg = "⚽ *CANLI MAÇLAR*\n\n"
-    for m in events[:20]:
-        min_str = get_min(m)
-        h = m['homeTeam'].get('shortName') or m['homeTeam']['name']
-        a = m['awayTeam'].get('shortName') or m['awayTeam']['name']
-        sh = m.get('homeScore', {}).get('current', 0)
-        sa = m.get('awayScore', {}).get('current', 0)
-        msg += f"⏱ `{min_str}` | {h} *{sh}-{sa}* {a}\n"
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+# --- SİNYAL MONİTÖRÜ ---
 
 async def signal_monitor(app):
-    print("🚀 Monitör başladı..."); sent = set()
+    print("🚀 Sinyal Monitörü Başladı...")
+    # Bot başladığında geçmişi yükle
+    sent_signals = load_history()
+
     while True:
         data = await fetch_api("https://api.sofascore.com/api/v1/sport/football/events/live")
-        for m in data.get('events', []):
-            mid = m['id']; minute = m.get('status', {}).get('elapsed', 0)
-            if mid not in sent and 10 < minute < 85:
-                # Detaylı istatistikleri çek
+        events = data.get('events', [])
+        
+        active_ids = []
+        for m in events:
+            mid = m['id']
+            active_ids.append(mid)
+            minute = m.get('status', {}).get('elapsed', 0)
+            
+            # Eğer bu maç ID'si daha önce gönderilmediyse ve dakika uygunsa
+            if str(mid) not in sent_signals and 15 < minute < 85:
                 stats = await get_stats(mid)
                 res = brain.analyze_advanced(m, stats, minute)
                 
@@ -76,18 +84,29 @@ async def signal_monitor(app):
                         f"⏰ *DAKİKA:* {minute}' ({res['period']})\n"
                         f"🔥 *BASKI GÜCÜ:* %{res['pressure']}\n"
                         f"🎯 *DURUM:* {res['stats_summary']}\n"
-                        f"🏆 *TAHMİN:* {res['pick']}\n"
-                        f"⭐ *GÜVEN:* {res['confidence']}\n\n"
-                        f"🚀 *BASKIDAKİ TAKIM:* {res['team']}\n\n"
+                        f"🏆 *TAHMİN:* {res['pick']}\n\n"
+                        f"🚀 *BASKIDAKİ TAKIM:* {res['team']}\n"
                         f"💸 *STAKE:* 4/10"
                     )
-                    await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
-                    sent.add(mid)
-        await asyncio.sleep(150)
+                    try:
+                        await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
+                        sent_signals.add(str(mid))
+                        save_history(sent_signals) # Her sinyalden sonra kaydet
+                        print(f"✅ Sinyal Gönderildi: {m['homeTeam']['name']}")
+                    except: pass
 
-async def post_init(app): asyncio.create_task(signal_monitor(app))
+        # Hafıza Temizliği: Biten maçları listeden çıkar (RAM şişmesin)
+        # Sadece o an canlı olan maçları tut, bitenleri listeden silebilirsin (opsiyonel)
+        # Ancak tekrar analiz etmesin istiyorsan bitenleri silmemek daha güvenli.
+        
+        await asyncio.sleep(120)
+
+# --- BOT BAŞLATICI ---
+
+async def post_init(app):
+    asyncio.create_task(signal_monitor(app))
 
 if __name__ == "__main__":
     application = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-    application.add_handler(CommandHandler("canli", live_command))
+    # /canli komutu vb. buraya eklenebilir
     application.run_polling()
