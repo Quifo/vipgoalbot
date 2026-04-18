@@ -97,26 +97,39 @@ async def control_command(update, context):
 
 # --- ANA DÖNGÜ ---
 async def signal_monitor(app):
-    print("🚀 Sinyal Monitörü Başladı..."); sent = await load_history()
+    print("🚀 Sinyal Monitörü Başladı...")
+    sent = await load_history()
     while True:
         try:
             data = await fetch_api(LIVE_URL)
             for m in data.get('events', []):
-                mid = str(m['id']); mn_str = get_real_minute(m)
+                mid = str(m['id'])
+                mn_str = get_real_minute(m)
                 try: mn_int = int(mn_str.replace("'", "")) if "'" in mn_str else 45
                 except: mn_int = 0
+                
                 if mid not in sent and 10 < mn_int < 85:
                     stats = await get_stats(mid)
                     if stats:
                         res = brain.analyze_advanced(m, stats, mn_int)
                         if res.get('is_signal'):
                             league = m.get('tournament', {}).get('name', 'Bilinmiyor')
-                            bar = "🟩" * (res['pressure'] // 10) + "⬜" * (10 - (res['pressure'] // 10))
-                            alt_txt = "".join([f"• {p[0]} ({p[2]})\n" for p in res['alt'][:3]])
+                            bar = "🟩" * (res['pressure'] // 10) + "⬜" * (10 - res['pressure'] // 10)
+                            
+                            # Ana tahmini alternatiflerden çıkar
+                            alt_picks = [p for p in res['alt'] if p[0] != res['pick']]
+                            alt_txt = ""
+                            if alt_picks:
+                                for p in alt_picks[:3]:
+                                    alt_txt += f"  • {p[0]} ({p[2]})\n"
+                            else:
+                                alt_txt = "  • Ek öneri yok\n"
+                            
                             txt = (
                                 f"🚨 *VIP ÇOKLU ANALİZ* 🚨\n\n"
                                 f"⚽ *{m['homeTeam']['name']}* `{res['score']}` *{m['awayTeam']['name']}*\n"
                                 f"🏆 _{league}_\n"
+                                f"⏱ *Dakika:* `{mn_str}` ({res['period']})\n"
                                 f"━━━━━━━━━━━━━━━━━━\n"
                                 f"🎯 *ANA TAHMİN:* `{res['pick']}`\n"
                                 f"📊 *Güven:* {res['confidence']} ({res['prob']}%)\n"
@@ -126,14 +139,17 @@ async def signal_monitor(app):
                                 f"{bar} `%{res['pressure']}`\n"
                                 f"🚀 *Baskı Yapan:* {res['team']}\n\n"
                                 f"📈 *İSTATİSTİKLER*\n"
-                                f"• Şut: `{stats['home_sot']}-{stats['away_sot']}` | T.Şut: `{stats['home_shots']}-{stats['away_shots']}`\n"
-                                f"• Korner: `{stats['home_corners']}-{stats['away_corners']} (Top: {res['corners']})`\n"
-                                f"• Hakimiyet: `% {stats['home_poss']}-% {stats['away_poss']}`\n\n"
+                                f"  🥅 Şut: `{stats['home_sot']}-{stats['away_sot']}`\n"
+                                f"  ⚡ T.Şut: `{stats['home_shots']}-{stats['away_shots']}`\n"
+                                f"  🚩 Korner: `{stats['home_corners']}-{stats['away_corners']}`\n"
+                                f"  🎮 Hakimiyet: `%{stats['home_poss']}-%{stats['away_poss']}`\n\n"
                                 f"💡 *ALTERNATİF ÖNERİLER*\n{alt_txt}\n"
-                                f"💎 _ROI Odaklı Profesyonel Analiz_"
+                                f"💎 _ROI Odakli Profesyonel Analiz_\n"
+                                f"⏰ {time.strftime('%H:%M')}"
                             )
                             await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
                             sent.add(mid); await save_history(sent)
+                            print(f"✅ Sinyal: {m['homeTeam']['name']} vs {m['awayTeam']['name']}")
         except Exception as e: print(f"Döngü hatası: {e}")
         await asyncio.sleep(120)
 
