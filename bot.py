@@ -7,54 +7,117 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Ayarlar
+# Railway Değişkenleri
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GIST_ID = os.getenv("GIST_ID")
 
 brain = BettingBrain()
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 GIST_HEADERS = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+URL = "https://api.sofascore.com/api/v1/sport/football/events/live"
 
 # --- DAKİKA HESAPLAMA (KESİN ÇÖZÜM) ---
 
 def get_real_minute(m):
     status = m.get('status', {})
     desc = status.get('description', '')
+    
     if desc == 'HT': return "İY"
     if desc == 'FT': return "MS"
-
-    # 1. SofaScore'un sunduğu elapsed verisi
+    
+    # 1. Öncelik: SofaScore'un kendi elapsed (geçen süre) verisi
     elapsed = status.get('elapsed')
     
-    # 2. Eğer elapsed 0 veya 1 ise alternatif hesaplama (Saniye üzerinden)
+    # 2. Eğer elapsed verisi 0, 1 veya None ise 'time' objesinden hesapla
     if not elapsed or elapsed <= 1:
-        current_s = m.get('time', {}).get('current')
-        if current_s:
-            elapsed = (current_s // 60) + 1
+        current_seconds = m.get('time', {}).get('current')
+        if current_seconds:
+            elapsed = (current_seconds // 60) + 1
             
-    # 3. Hala 0' ise startTimestamp üzerinden hesapla (En garantisi)
+    # 3. Eğer hala sonuç alınamadıysa bilgisayar saatiyle startTimestamp farkına bak
     if not elapsed or elapsed <= 1:
         start_ts = m.get('startTimestamp')
         if start_ts:
             now_ts = int(time.time())
             diff = (now_ts - start_ts) // 60
-            if 0 < diff < 120: # Mantıklı bir aralıktaysa
+            if 0 < diff < 130: # Mantıklı aralıktaysa
                 elapsed = diff
 
     return f"{elapsed or 1}'"
 
-# --- API VE BULUT SİSTEMİ ---
+# --- API VE BULUT HAFIZA ---
 
 async def fetch_api(url):
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
         try:
             r = await client.get(url, headers=HEADERS)
             return r.json() if r.status_code == 200 else {}
-        except Exception as e:
-            print(f"⚠️ API Hatası: {e}")
-            return {}
+        except: return {}
+
+async def load_history():
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.get(url, headers=GIST_HEADERS)
+            content = r.json()['files']['sent_signals.json']['content']
+            return set(json.loads(content))
+        except: return set()
+
+async def save_history(sent_set):
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    data = {"files": {"sent_signals.json": {"content": json.dumps(list(sent_set))}}}
+    async with httpx.AsyncClient() as client:
+        try: await client.patch(url, headers=GIST_HEADERS, json=data)
+        except: pass
+
+# --- YENİ KOMUTLAR ---
+
+async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/kontrol: Botun tüm fonksiyonlarını test eder."""
+    status_msg = await update.message.reply_text("⚙️ *Sistem Kontrolü Başlatılıyor...*", parse_mode=ParseMode.MARKDOWN)
+    
+    # 1. API Kontrolü
+    api_data = await fetch_api(URL)
+    api_res = "✅ OK" if api_data else "❌ HATA"
+    
+    # 2. Gist Kontrolü
+    gist_data = await load_history()
+    gist_res = "✅ OK" if isinstance(gist_data, set) else "❌ HATA"
+    
+    # 3. Brain Kontrolü
+    try:
+        test_brain = brain.calculate_pressure({'sot': 5, 'da': 30}, 20)
+        brain_res = "✅ OK" if test_brain > 0 else "❌ HATA"
+    except: brain_res = "❌ HATA"
+
+    report = (
+        f"🖥 *BOT DURUM RAPORU*\n\n"
+        f"📡 *SofaScore API:* {api_res}\n"
+        f"☁️ *GitHub Gist:* {gist_res}\n"
+        f"🧠 *Analiz Motoru:* {brain_res}\n"
+        f"⏰ *Server Saati:* {time.strftime('%H:%M:%S')}\n\n"
+        f"🚀 _Sistem sorunsuz çalışıyor!_" if "❌" not in (api_res, gist_res, brain_res) else "⚠️ _Sorun tespit edildi!_"
+    )
+    await status_msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
+
+async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = await fetch_api(URL)
+    events = data.get('events', [])
+    if not events: await update.message.reply_text("Canlı maç yok."); return
+    
+    msg = "⚽ *CANLI MAÇLAR*\n\n"
+    for m in events[:20]:
+        minute = get_real_minute(m)
+        h = m.get('homeTeam', {}).get('shortName') or m.get('homeTeam', {}).get('name')
+        a = m.get('awayTeam', {}).get('shortName') or m.get('awayTeam', {}).get('name')
+        score_h = m.get('homeScore', {}).get('current', 0)
+        score_a = m.get('awayScore', {}).get('current', 0)
+        msg += f"⏱ `{minute}` | {h} *{score_h}-{score_a}* {a}\n"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+# --- ANALİZ DÖNGÜSÜ ---
 
 async def get_stats(match_id):
     url = f"https://api.sofascore.com/api/v1/event/{match_id}/statistics"
@@ -70,54 +133,12 @@ async def get_stats(match_id):
                         stats['home_da'] = int(i['homeValue']); stats['away_da'] = int(i['awayValue'])
     return stats
 
-async def load_history():
-    url = f"https://api.github.com/gists/{GIST_ID}"
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get(url, headers=GIST_HEADERS)
-            if r.status_code == 200:
-                files = r.json().get('files', {})
-                content = files.get('sent_signals.json', {}).get('content', '[]')
-                return set(json.loads(content))
-            return set()
-        except: return set()
-
-async def save_history(sent_set):
-    url = f"https://api.github.com/gists/{GIST_ID}"
-    data = {"files": {"sent_signals.json": {"content": json.dumps(list(sent_set))}}}
-    async with httpx.AsyncClient() as client:
-        try: await client.patch(url, headers=GIST_HEADERS, json=data)
-        except: print("⚠️ Gist yazma hatası")
-
-# --- KOMUTLAR ---
-
-async def live_command(update, context):
-    print("📥 /canli komutu tetiklendi.")
-    data = await fetch_api("https://api.sofascore.com/api/v1/sport/football/events/live")
-    events = data.get('events', [])
-    if not events: await update.message.reply_text("Canlı maç yok."); return
-    
-    msg = "⚽ *CANLI MAÇLAR*\n\n"
-    for m in events[:20]:
-        minute = get_real_minute(m)
-        h = m['homeTeam'].get('shortName') or m['homeTeam']['name']
-        a = m['awayTeam'].get('shortName') or m['awayTeam']['name']
-        sh = m.get('homeScore', {}).get('current', 0)
-        sa = m.get('awayScore', {}).get('current', 0)
-        msg += f"⏱ `{minute}` | {h} *{sh}-{sa}* {a}\n"
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-# --- SİNYAL MONİTÖRÜ ---
-
 async def signal_monitor(app):
-    print("🚀 Sinyal tarama döngüsü başlatıldı...")
     sent_signals = await load_history()
-    
     while True:
         try:
-            data = await fetch_api("https://api.sofascore.com/api/v1/sport/football/events/live")
+            data = await fetch_api(URL)
             events = data.get('events', [])
-            
             for m in events:
                 mid = str(m['id'])
                 minute_str = get_real_minute(m)
@@ -140,26 +161,14 @@ async def signal_monitor(app):
                             f"💸 *STAKE:* 4/10"
                         )
                         await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
-                        sent_signals.add(mid)
-                        await save_history(sent_signals)
-                        print(f"✅ Sinyal Gönderildi: {m['homeTeam']['name']}")
-            
-            await asyncio.sleep(180) # 3 dakikada bir tarama
-        except Exception as e:
-            print(f"⚠️ Döngüde Hata: {e}")
-            await asyncio.sleep(10)
+                        sent_signals.add(mid); await save_history(sent_signals)
+            await asyncio.sleep(150)
+        except: await asyncio.sleep(10)
 
-# --- BAŞLATICI ---
-
-async def post_init(application):
-    # Railway'de donmayı önlemek için döngüyü ayrı bir task olarak başlatıyoruz
-    asyncio.create_task(signal_monitor(application))
+async def post_init(app): asyncio.create_task(signal_monitor(app))
 
 if __name__ == "__main__":
-    print("🤖 Bot ana süreci başlıyor...")
-    application = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-    application.add_handler(CommandHandler("canli", live_command))
-    application.add_handler(CommandHandler("live", live_command))
-    
-    print("✅ Polling başlatılıyor. Bot artık komut dinliyor.")
-    application.run_polling()
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("canli", live_command))
+    app.add_handler(CommandHandler("kontrol", control_command))
+    app.run_polling()
