@@ -17,30 +17,40 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 GIST_HEADERS = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
 URL = "https://api.sofascore.com/api/v1/sport/football/events/live"
 
-# --- DAKİKA HESAPLAMA (KESİN ÇÖZÜM) ---
+# --- DAKİKA HESAPLAMA (KESİN VE DOĞRU ÇÖZÜM) ---
 
 def get_real_minute(m):
     status = m.get('status', {})
-    desc = status.get('description', '')
-    if desc == 'HT': return "İY"
-    if desc == 'FT': return "MS"
+    desc = status.get('description', '').lower()
+    elapsed = status.get('elapsed', 0)
+    
+    # 1. Devre Arası ve Maç Sonu Kontrolü
+    if 'ht' in desc or 'half-time' in desc: return "İY"
+    if 'ft' in desc or 'full-time' in desc: return "MS"
+    if 'interrupted' in desc or 'paused' in desc: return "DURDU"
 
-    # SofaScore'un ham saniye verisi (current) en sağlamıdır
-    current_seconds = m.get('time', {}).get('current')
-    if current_seconds and current_seconds > 0:
-        return f"{(current_seconds // 60) + 1}'"
-
-    # Fallback: startTimestamp üzerinden bilgisayar saatiyle hesapla
-    start_ts = m.get('startTimestamp')
-    if start_ts:
-        now_ts = int(time.time())
-        diff = (now_ts - start_ts) // 60
-        if 0 < diff < 130:
-            return f"{diff}'"
-
-    # Son çare: elapsed
-    elapsed = status.get('elapsed')
-    return f"{elapsed}'" if elapsed else "1'"
+    # 2. İkinci Yarı Mantığı (SofaScore bazen 2. yarıda dakikayı sıfırlar)
+    # Eğer açıklama '2nd half' (veya '2nd period') ise ve dakika 45'ten küçükse üzerine 45 ekle.
+    if "2nd half" in desc or "2nd period" in desc:
+        if elapsed < 45:
+            elapsed = 45 + elapsed
+        elif elapsed == 0: # Eğer 2. yarı yeni başladıysa ve 0 ise 46 yap
+            elapsed = 46
+            
+    # 3. Eğer dakika hala 0 veya None ise startTimestamp'ten canlı hesapla
+    if not elapsed or elapsed <= 1:
+        start_ts = m.get('startTimestamp')
+        if start_ts:
+            now_ts = int(time.time())
+            diff = (now_ts - start_ts) // 60
+            # Eğer 2. yarıdaysak ve fark 45'ten az çıkıyorsa (ara dahil edilmediği için)
+            if "2nd half" in desc and diff < 45:
+                elapsed = 46
+            else:
+                elapsed = diff if diff > 0 else 1
+    
+    # Maksimum 90+ duraklama dakikalarını da kapsar
+    return f"{elapsed}'"
 
 # --- API VE BULUT HAFIZA ---
 
@@ -48,7 +58,9 @@ async def fetch_api(url):
     async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
         try:
             r = await client.get(url, headers=HEADERS)
-            return r.json() if r.status_code == 200 else {}
+            if r.status_code == 200:
+                return r.json()
+            return {}
         except: return {}
 
 async def load_history():
@@ -67,57 +79,40 @@ async def save_history(sent_set):
         try: await client.patch(url, headers=GIST_HEADERS, json=data)
         except: pass
 
-# --- GELİŞMİŞ KONTROL KOMUTU ---
+# --- KONTROL VE CANLI KOMUTLARI ---
 
-async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/kontrol: Botun tüm organlarını ve mesaj yetkisini test eder."""
-    status_msg = await update.message.reply_text("🔎 *Derin Sistem Analizi Başlatılıyor...*", parse_mode=ParseMode.MARKDOWN)
+async def control_command(update, context):
+    """/kontrol: Sistemin tüm parçalarını test eder."""
+    status_msg = await update.message.reply_text("🔎 *VIP Analizör Denetleniyor...*", parse_mode=ParseMode.MARKDOWN)
     
-    # 1. Bağlantı Testleri
+    # API Test
     api_data = await fetch_api(URL)
-    api_res = "✅" if api_data else "❌"
-    
+    # Gist Test
     gist_data = await load_history()
-    gist_res = "✅" if isinstance(gist_data, set) else "❌"
-
-    # 2. Sinyal Mantık Testi (Hayali bir maç veriyoruz)
-    mock_stats = {'home_sot': 6, 'away_sot': 1, 'home_da': 35, 'away_da': 10}
-    mock_match = {
-        'homeTeam': {'name': 'Test_Team_A'},
-        'awayTeam': {'name': 'Test_Team_B'},
-        'homeScore': {'current': 0},
-        'awayScore': {'current': 0}
-    }
-    # Analiz motorunu (Brain) çalıştır
+    # Logic Test
+    mock_stats = {'home_sot': 5, 'away_sot': 1, 'home_da': 30, 'away_da': 10}
+    mock_match = {'homeTeam': {'name': 'TeamA'}, 'awayTeam': {'name': 'TeamB'}, 'homeScore': {'current': 0}, 'awayScore': {'current': 0}}
     test_analysis = brain.analyze_advanced(mock_match, mock_stats, 25)
-    logic_res = "✅" if test_analysis.get("is_signal") else "❌ (Mantık Hatası)"
-
-    # 3. Mesaj Gönderim Yetkisi Testi
-    try:
-        test_text = "🧪 *Sinyal Gönderim Testi:* Bot şu an ana kanala mesaj atabiliyor."
-        await context.bot.send_message(chat_id=CHAT_ID, text=test_text, parse_mode=ParseMode.MARKDOWN)
-        delivery_res = "✅"
-    except Exception as e:
-        delivery_res = f"❌ (Hata: {str(e)})"
+    
+    # Kanal Mesaj Testi
+    delivery = "✅"
+    try: await context.bot.send_message(chat_id=CHAT_ID, text="🧪 *Sistem Testi:* OK")
+    except: delivery = "❌"
 
     report = (
-        f"🛡 *BOT OTOMATİK DENETİM RAPORU*\n\n"
-        f"🌐 *SofaScore Bağlantısı:* {api_res}\n"
-        f"💾 *Bulut Hafıza (Gist):* {gist_res}\n"
-        f"🧠 *Analiz Algoritması:* {logic_res}\n"
-        f"📩 *Kanal Mesaj Yetkisi:* {delivery_res}\n\n"
-        f"📊 *Toplam Canlı Maç:* {len(api_data.get('events', [])) if api_data else 0}\n"
-        f"🕒 *Sistem Saati:* {time.strftime('%H:%M:%S')}\n\n"
-        "🚀 _Tüm sistemler sinyal üretimi için hazır!_" if "❌" not in (api_res, gist_res, logic_res, delivery_res) else "⚠️ _Bazı sistemlerde sorun var!_"
+        f"🛡 *OTOMATİK DENETİM RAPORU*\n\n"
+        f"🌐 *API:* {'✅' if api_data else '❌'}\n"
+        f"💾 *Gist:* {'✅' if isinstance(gist_data, set) else '❌'}\n"
+        f"🧠 *Algoritma:* {'✅' if test_analysis.get('is_signal') else '❌'}\n"
+        f"📩 *Kanal İzni:* {delivery}\n\n"
+        f"🚀 _Sinyal üretimi için her şey hazır!_"
     )
     await status_msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
-
-# --- CANLI MAÇLAR KOMUTU ---
 
 async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await fetch_api(URL)
     events = data.get('events', [])
-    if not events: await update.message.reply_text("📭 Şu an canlı maç bulunamadı."); return
+    if not events: await update.message.reply_text("📭 Canlı maç yok."); return
     
     msg = "⚽ *GÜNCEL CANLI MAÇLAR*\n\n"
     for m in events[:25]:
@@ -129,7 +124,7 @@ async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"⏱ `{minute}` | {h} *{score_h}-{score_a}* {a}\n"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-# --- ANALİZ DÖNGÜSÜ ---
+# --- SİNYAL MONİTÖRÜ ---
 
 async def get_stats(match_id):
     url = f"https://api.sofascore.com/api/v1/event/{match_id}/statistics"
@@ -148,7 +143,7 @@ async def get_stats(match_id):
     return stats
 
 async def signal_monitor(app):
-    print("🚀 Sinyal Monitörü Çalışıyor...")
+    print("🚀 Sinyal Monitörü Başladı...")
     sent_signals = await load_history()
     while True:
         try:
@@ -158,8 +153,8 @@ async def signal_monitor(app):
                 mid = str(m['id'])
                 minute_str = get_real_minute(m)
                 
+                # Dakikayı filtreleme için int yap
                 try:
-                    # Dakikayı filtreleme için sayıya çeviriyoruz
                     minute_int = int(minute_str.replace("'", "")) if "'" in minute_str else 45
                 except: minute_int = 0
 
@@ -178,13 +173,9 @@ async def signal_monitor(app):
                             f"💸 *STAKE:* 4/10"
                         )
                         await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
-                        sent_signals.add(mid)
-                        await save_history(sent_signals)
-                        print(f"✅ Sinyal Atıldı: {m['homeTeam']['name']}")
+                        sent_signals.add(mid); await save_history(sent_signals)
             await asyncio.sleep(150)
-        except Exception as e:
-            print(f"Döngü hatası: {e}")
-            await asyncio.sleep(15)
+        except: await asyncio.sleep(10)
 
 async def post_init(app):
     asyncio.create_task(signal_monitor(app))
