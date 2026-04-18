@@ -22,53 +22,85 @@ STATS_URL = "https://www.sofascore.com/api/v1/event/{}/statistics"
 # --- GELİŞMİŞ AI ANALİZİ ---
 async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
     if not GEMINI_KEY:
-        print("⚠️ GEMINI_KEY bulunamadı, varsayılan yorum kullanılıyor.")
-        return "AI devre dışı."
+        print("⚠️ GEMINI_KEY bulunamadı")
+        return "AI devre dışı - API key eksik."
     
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
+    # Farklı modelleri sırayla dene
+    models = ["gemini-1.5-flash", "gemini-pro", "gemini-2.0-flash"]
+    
+    prompt_text = (
+        f"Sen profesyonel bir futbol analisti ve bahis trader'ısın.\n"
+        f"Maç: {home} vs {away}\n"
+        f"Skor: {score} | Dakika: {minute}'\n"
+        f"Ev sahibi - İsabetli şut: {stats.get('home_sot',0)}, Toplam şut: {stats.get('home_shots',0)}, "
+        f"Korner: {stats.get('home_corners',0)}, Hakimiyet: %{stats.get('home_poss',50)}\n"
+        f"Deplasman - İsabetli şut: {stats.get('away_sot',0)}, Toplam şut: {stats.get('away_shots',0)}, "
+        f"Korner: {stats.get('away_corners',0)}, Hakimiyet: %{stats.get('away_poss',50)}\n"
+        f"Baskı gucu: %{pressure}\n"
+        f"Onerilen bahis: {pick}\n\n"
+        f"Bu verilere dayanarak bu bahsin neden mantikli oldugunu 2 cumleyle acikla. "
+        f"Ozel karakter kullanma. Banko veya kesin gibi kelimeler kullanma. "
+        f"Sadece istatistiklere dayanan teknik analiz yap."
+    )
     
     prompt = {
-        "contents": [{
-            "parts": [{
-                "text": (
-                    f"Sen bir profesyonel bahis analistisin. Şu maçı kısaca analiz et:\n"
-                    f"Maç: {home} vs {away}\n"
-                    f"Dakika: {minute}'\n"
-                    f"Skor: {score}\n"
-                    f"İsabetli Şut (Ev-Dep): {stats.get('home_sot',0)}-{stats.get('away_sot',0)}\n"
-                    f"Toplam Şut: {stats.get('home_shots',0)}-{stats.get('away_shots',0)}\n"
-                    f"Korner: {stats.get('home_corners',0)}-{stats.get('away_corners',0)}\n"
-                    f"Top Hakimiyeti: %{stats.get('home_poss',50)}-%{stats.get('away_poss',50)}\n"
-                    f"Baskı Gücü: %{pressure}\n"
-                    f"Önerilen Bahis: {pick}\n\n"
-                    f"KURALLAR:\n"
-                    f"- Maksimum 2 cümle yaz\n"
-                    f"- Neden bu bahis mantıklı açıkla\n"
-                    f"- Yıldız, alt çizgi gibi özel karakter KULLANMA\n"
-                    f"- Banko, kesin gibi kelimeler KULLANMA\n"
-                    f"- Sadece veri bazlı teknik yorum yap"
-                )
-            }]
-        }]
+        "contents": [{"parts": [{"text": prompt_text}]}],
+        "generationConfig": {"maxOutputTokens": 150, "temperature": 0.9}
     }
     
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            r = await client.post(url, json=prompt)
-            data = r.json()
-            
-            if r.status_code != 200:
-                print(f"⚠️ AI API Hatası: {r.status_code}")
-                return f"{home} takımının isabetli şut oranı ve baskı puanı gol olasılığını artırıyor."
-            
-            comment = data['candidates'][0]['content']['parts'][0]['text']
-            # Telegram Markdown bozacak karakterleri temizle
-            clean = comment.replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '').strip()
-            print(f"🧠 AI Yanıtı: {clean[:50]}...")
-            return clean
-        except Exception as e:
-            print(f"⚠️ AI Hatası: {e}")
-            return f"{home} takımının isabetli şut oranı ve baskı puanı gol olasılığını artırıyor."
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            try:
+                r = await client.post(url, json=prompt)
+                data = r.json()
+                
+                # Hata kontrolü
+                if r.status_code != 200:
+                    print(f"⚠️ AI Model {model} hata verdi: {r.status_code} - {data.get('error', {}).get('message', 'Bilinmeyen')}")
+                    continue
+                
+                # Yanıt kontrolü
+                candidates = data.get('candidates', [])
+                if not candidates:
+                    print(f"⚠️ AI Model {model} boş yanıt döndü")
+                    continue
+                
+                comment = candidates[0].get('content', {}).get('parts', [{}])[0].get('text', '')
+                if not comment:
+                    print(f"⚠️ AI Model {model} text boş")
+                    continue
+                
+                # Temizle ve döndür
+                clean = comment.replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '').replace('#', '').strip()
+                print(f"🧠 AI ({model}): {clean[:60]}...")
+                return clean
+                
+            except Exception as e:
+                print(f"⚠️ AI Model {model} exception: {e}")
+                continue
+    
+    # Hiçbir model çalışmazsa maça özel dinamik yorum üret
+    print("⚠️ Tüm AI modelleri başarısız, dinamik yorum üretiliyor...")
+    
+    total_sot = stats.get('home_sot', 0) + stats.get('away_sot', 0)
+    total_shots = stats.get('home_shots', 0) + stats.get('away_shots', 0)
+    total_corners = stats.get('home_corners', 0) + stats.get('away_corners', 0)
+    
+    comments = [
+        f"{home} toplam {stats.get('home_shots',0)} sut cekerken {stats.get('home_sot',0)} isabetli sut buldu. %{pressure} baski puani ile gol olasiligi yukseliyor.",
+        f"Mac genelinde {total_sot} isabetli sut ve {total_corners} korner gorunuyor. Bu tempo {pick} baremi icin yeterli verimliligi sagliyor.",
+        f"{minute}. dakikada {total_shots} toplam sut atilmis durumda. Dakika basina sut orani gol beklentisini destekleyen seviyede.",
+        f"Hakimiyet %{stats.get('home_poss',50)}-%{stats.get('away_poss',50)} dagiliminda. Baski kuran taraf {total_sot} isabetli sutu buldu, gol kapida.",
+        f"Son verilere gore {home} ile {away} arasindaki macta toplam {total_corners} korner kullanildi. Set oyunlari ve baski gol olasiligini artiriyor.",
+        f"{total_shots} sut ve {total_corners} korner ile macin temposu yukseldi. %{pressure} baski puani bu dakikada ciddi bir gol sinyali veriyor."
+    ]
+    
+    # Maç ID'sine göre farklı yorum seç (Her maçta farklı olsun)
+    import hashlib
+    idx = int(hashlib.md5(f"{home}{away}{minute}".encode()).hexdigest(), 16) % len(comments)
+    return comments[idx]
 
 # --- YARDIMCI FONKSİYONLAR ---
 async def fetch_api(url):
