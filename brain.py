@@ -2,43 +2,49 @@ import math
 
 class BettingBrain:
     def __init__(self):
-        # KRİTERLERİ GEVŞETTİK (Daha fazla sinyal için)
-        self.MIN_TOTAL_DA = 10    # Toplam Tehlikeli Atak (Daha önce 15'ti)
-        self.MIN_SOT = 1          # En az 1 isabetli şut (Daha önce 2'ydi)
-        self.MIN_PRESSURE = 35    # Baskı eşiği (Daha önce 45'ti)
+        self.MIN_TOTAL_SHOTS = 6
+        self.MIN_PRESSURE = 40
 
     def calculate_pressure(self, stats, minute):
-        da = stats.get('da', 0)
-        sot = stats.get('sot', 0)
+        """SofaScore'un gerçekten tuttuğu verilerle baskı hesaplar"""
         if minute <= 0: minute = 1
         
-        da_rate = da / minute
-        # Baskı formülü
-        pressure = (da_rate * 50) + (sot * 8)
-        return min(100, int(pressure))
+        # Gerçek SofaScore verileri
+        sot = stats.get('sot', 0)           # İsabetli şut
+        total_shots = stats.get('shots', 0)  # Toplam şut
+        corners = stats.get('corners', 0)    # Korner
+        poss = stats.get('poss', 50)         # Top hakimiyeti
+        
+        # Baskı puanı hesabı (Veri uyumlu)
+        score = 0
+        score += sot * 12                          # Her isabetli şut +12
+        score += total_shots * 4                   # Her şut +4
+        score += corners * 6                       # Her korner +6
+        score += max(0, poss - 50) * 0.8           # %50 üstü hakimiyet bonus
+        
+        return min(100, int(score))
 
     def analyze_advanced(self, match_data, stats, minute):
-        h_da = stats.get('home_da', 0)
-        a_da = stats.get('away_da', 0)
-        h_sot = stats.get('home_sot', 0)
-        a_sot = stats.get('away_sot', 0)
+        h = {'sot': stats['home_sot'], 'shots': stats['home_shots'], 
+             'corners': stats['home_corners'], 'poss': stats['home_poss']}
+        a = {'sot': stats['away_sot'], 'shots': stats['away_shots'], 
+             'corners': stats['away_corners'], 'poss': stats['away_poss']}
+
+        h_pressure = self.calculate_pressure(h, minute)
+        a_pressure = self.calculate_pressure(a, minute)
         
-        total_da = h_da + a_da
-        total_sot = h_sot + a_sot
-        
-        # Filtreleme
-        if total_da < self.MIN_TOTAL_DA and total_sot < self.MIN_SOT:
+        total_shots = stats['home_shots'] + stats['away_shots']
+        if total_shots < self.MIN_TOTAL_SHOTS:
             return {"is_signal": False}
         
-        h_pressure = self.calculate_pressure({'da': h_da, 'sot': h_sot}, minute)
-        a_pressure = self.calculate_pressure({'da': a_da, 'sot': a_sot}, minute)
-        
         if h_pressure > a_pressure and h_pressure >= self.MIN_PRESSURE:
-            target_team = match_data['homeTeam']['name']
+            target = match_data['homeTeam']['name']
             final_pressure = h_pressure
+            target_stats = h
         elif a_pressure > h_pressure and a_pressure >= self.MIN_PRESSURE:
-            target_team = match_data['awayTeam']['name']
+            target = match_data['awayTeam']['name']
             final_pressure = a_pressure
+            target_stats = a
         else:
             return {"is_signal": False}
         
@@ -46,16 +52,30 @@ class BettingBrain:
         a_score = match_data.get('awayScore', {}).get('current', 0)
         total_score = h_score + a_score
         
-        # Bahis türü
-        if minute <= 35: pick = "İLK YARI 0.5 ÜST"
-        else: pick = f"{total_score + 0.5} ÜST (GOL BEKLENTİSİ)"
+        # Akıllı bahis önerisi
+        if minute <= 35:
+            pick = "İLK YARI 0.5 ÜST"
+            risk = "Düşük"
+        elif total_score == 0:
+            pick = "0.5 ÜST"
+            risk = "Düşük"
+        elif total_score == 1:
+            pick = "1.5 ÜST / KG VAR"
+            risk = "Orta"
+        else:
+            pick = f"{total_score + 0.5} ÜST"
+            risk = "Orta"
+        
+        confidence = "🔥 ELITE" if final_pressure >= 70 else ("⭐ YÜKSEK" if final_pressure >= 55 else "📊 ORTA")
         
         return {
             "is_signal": True,
-            "team": target_team,
+            "team": target,
             "pressure": final_pressure,
             "period": "1. YARI" if minute < 45 else "2. YARI",
             "pick": pick,
-            "confidence": "ELITE" if final_pressure > 65 else "YÜKSEK",
-            "stats_summary": f"İS: {total_sot} | TA: {total_da} | Baskı: {final_pressure}/100"
+            "confidence": confidence,
+            "risk": risk,
+            "target_stats": target_stats,
+            "all_stats": stats
         }
