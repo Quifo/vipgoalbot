@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- CONFIG ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GIST_ID = os.getenv("GIST_ID")
@@ -20,8 +19,58 @@ GIST_HEADERS = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application
 LIVE_URL = "https://www.sofascore.com/api/v1/sport/football/events/live"
 STATS_URL = "https://www.sofascore.com/api/v1/event/{}/statistics"
 
-# --- YARDIMCI FONKSİYONLAR ---
+# --- GELİŞMİŞ AI ANALİZİ ---
+async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
+    if not GEMINI_KEY:
+        print("⚠️ GEMINI_KEY bulunamadı, varsayılan yorum kullanılıyor.")
+        return "AI devre dışı."
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
+    
+    prompt = {
+        "contents": [{
+            "parts": [{
+                "text": (
+                    f"Sen bir profesyonel bahis analistisin. Şu maçı kısaca analiz et:\n"
+                    f"Maç: {home} vs {away}\n"
+                    f"Dakika: {minute}'\n"
+                    f"Skor: {score}\n"
+                    f"İsabetli Şut (Ev-Dep): {stats.get('home_sot',0)}-{stats.get('away_sot',0)}\n"
+                    f"Toplam Şut: {stats.get('home_shots',0)}-{stats.get('away_shots',0)}\n"
+                    f"Korner: {stats.get('home_corners',0)}-{stats.get('away_corners',0)}\n"
+                    f"Top Hakimiyeti: %{stats.get('home_poss',50)}-%{stats.get('away_poss',50)}\n"
+                    f"Baskı Gücü: %{pressure}\n"
+                    f"Önerilen Bahis: {pick}\n\n"
+                    f"KURALLAR:\n"
+                    f"- Maksimum 2 cümle yaz\n"
+                    f"- Neden bu bahis mantıklı açıkla\n"
+                    f"- Yıldız, alt çizgi gibi özel karakter KULLANMA\n"
+                    f"- Banko, kesin gibi kelimeler KULLANMA\n"
+                    f"- Sadece veri bazlı teknik yorum yap"
+                )
+            }]
+        }]
+    }
+    
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            r = await client.post(url, json=prompt)
+            data = r.json()
+            
+            if r.status_code != 200:
+                print(f"⚠️ AI API Hatası: {r.status_code}")
+                return f"{home} takımının isabetli şut oranı ve baskı puanı gol olasılığını artırıyor."
+            
+            comment = data['candidates'][0]['content']['parts'][0]['text']
+            # Telegram Markdown bozacak karakterleri temizle
+            clean = comment.replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '').strip()
+            print(f"🧠 AI Yanıtı: {clean[:50]}...")
+            return clean
+        except Exception as e:
+            print(f"⚠️ AI Hatası: {e}")
+            return f"{home} takımının isabetli şut oranı ve baskı puanı gol olasılığını artırıyor."
 
+# --- YARDIMCI FONKSİYONLAR ---
 async def fetch_api(url):
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         try:
@@ -43,20 +92,6 @@ def get_real_minute(m):
             elapsed = diff if 0 < diff < 130 else 1
     return f"{elapsed or 1}'"
 
-# --- AI ANALİZİ (Kütüphanesiz Doğrudan API) ---
-async def get_ai_insight(match_name, stats, pick, pressure):
-    if not GEMINI_KEY: return "Analiz: Momentum gol olasılığını teknik olarak destekliyor."
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_KEY}"
-    prompt = {"contents": [{"parts": [{"text": f"Analiz et: {match_name}, {stats}, Bahis: {pick}, Baskı: %{pressure}. Neden bu bahis mantıklı? 1 kısa cümle, teknik konuş. Kalın yazı veya özel karakter kullanma."}]}]}
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            r = await client.post(url, json=prompt)
-            data = r.json()
-            comment = data['candidates'][0]['content']['parts'][0]['text']
-            return comment.replace('*', '').replace('_', '').replace('`', '')
-        except: return "Veri akışı ve baskı puanı barem artışını destekliyor."
-
-# --- BULUT HAFIZA VE TAKİP ---
 async def manage_history(mode="read", data=None):
     url = f"https://api.github.com/gists/{GIST_ID}"
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -88,9 +123,13 @@ async def get_stats(match_id):
     except: return None
 
 # --- KOMUTLAR ---
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 *VIP Pro Trader Bot Aktif!*\n\n/canli - Maçları listeler\n/kontrol - Denetim yapar", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        "🤖 *VIP Pro Trader Bot Aktif!*\n\n"
+        "/canli - Canlı maçları listeler\n"
+        "/kontrol - Sistem denetimi yapar",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_chat_action("typing")
@@ -108,25 +147,30 @@ async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🔎 *Sistem Denetleniyor...*", parse_mode=ParseMode.MARKDOWN)
     api_data = await fetch_api(LIVE_URL)
     gist_data = await manage_history("read")
-    ai_test = await get_ai_insight("Test", "Stats", "Pick", 50)
+    ai_test = await get_ai_insight("TestA", "TestB", {'home_sot':3,'away_sot':1,'home_shots':8,'away_shots':3,'home_corners':4,'away_corners':1,'home_poss':60,'away_poss':40}, "1.5 ÜST", 70, 55, "1-0")
     
     delivery = "✅ OK"
     try: await context.bot.send_message(chat_id=CHAT_ID, text="🧪 Sistem Testi")
     except: delivery = "❌ HATA"
     
+    ai_status = "✅ OK" if len(ai_test) > 10 and "devre dışı" not in ai_test.lower() else "❌ HATA"
+    
     report = (
-        f"🛡 *BOT DENETİMİ*\n\n"
+        f"🛡 *BOT DENETİM RAPORU*\n\n"
         f"🌐 API: {'✅ OK' if api_data else '❌ HATA'}\n"
         f"💾 Gist: {'✅ OK' if isinstance(gist_data, list) else '❌ HATA'}\n"
-        f"🧠 AI: {'✅ OK' if 'Analiz' in ai_test or len(ai_test) > 5 else '❌ HATA'}\n"
-        f"📩 İletim: {delivery}"
+        f"🧠 AI: {ai_status}\n"
+        f"📩 İletim: {delivery}\n"
+        f"⚽ Canlı Maç: {len(api_data.get('events', []))}\n"
+        f"📊 Hafızadaki Sinyal: {len(gist_data) if isinstance(gist_data, list) else 0}\n\n"
+        f"🚀 _Sistem aktif!_"
     )
-    await update.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
+    await msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
 
 # --- DÖNGÜLER ---
-
 async def result_tracker(app):
     while True:
         try:
@@ -139,7 +183,9 @@ async def result_tracker(app):
                     if ev.get('status', {}).get('type') == 'finished':
                         is_win = (ev['homeScore']['current'] + ev['awayScore']['current']) > sig['start_total']
                         sig['status'] = 'WIN ✅' if is_win else 'LOSS ❌'
+                        sig['final_score'] = f"{ev['homeScore']['current']}-{ev['awayScore']['current']}"
                         updated = True
+                        print(f"📋 Sonuç: {sig.get('match','?')} -> {sig['status']} ({sig['final_score']})")
             if updated: await manage_history("write", history)
         except: pass
         await asyncio.sleep(600)
@@ -152,6 +198,8 @@ async def signal_monitor(app):
             events = data.get('events', [])
             history = await manage_history("read")
             sent_ids = [str(x['id']) for x in history]
+            
+            print(f"📊 {len(events)} maç taranıyor | Hafızada {len(history)} sinyal")
 
             for m in events:
                 mid = str(m['id'])
@@ -166,34 +214,73 @@ async def signal_monitor(app):
                         res = brain.analyze_advanced(m, stats, mn_int, odds_drop)
                         
                         if res.get('is_signal'):
-                            ai_msg = await get_ai_insight(f"{m['homeTeam']['name']}-{m['awayTeam']['name']}", res['stats_summary'], res['pick'], res['pressure'])
+                            home_name = m['homeTeam']['name']
+                            away_name = m['awayTeam']['name']
+                            league = m.get('tournament', {}).get('name', 'Bilinmiyor')
+                            
+                            print(f"🔍 Sinyal bulundu: {home_name} vs {away_name} ({minute_str})")
+                            
+                            # AI Yorumu Al
+                            ai_msg = await get_ai_insight(home_name, away_name, stats, res['pick'], res['pressure'], mn_int, res['score'])
+                            
+                            # Alternatif bahisleri formatla (Ana tahmini hariç tut)
+                            alt_picks = [p for p in res.get('alt', []) if p[0] != res['pick']]
+                            alt_txt = ""
+                            if alt_picks:
+                                for p in alt_picks[:3]:
+                                    alt_txt += f"  • {p[0]} (Risk: {p[2]})\n"
+                            
+                            # Baskı barı
                             bar = "🟩" * (res['pressure'] // 10) + "⬜" * (10 - res['pressure'] // 10)
+                            
+                            # Alternatif bölümü varsa ekle
+                            alt_section = ""
+                            if alt_txt:
+                                alt_section = f"\n💡 *ALTERNATİF ÖNERİLER*\n{alt_txt}"
+                            
                             txt = (
                                 f"🚨 *VIP PRO TRADER ANALİZİ* 🚨\n\n"
-                                f"⚽ *{m['homeTeam']['name']}* `{res['score']}` *{m['awayTeam']['name']}*\n"
-                                f"🏆 _{m['tournament']['name']}_\n"
-                                f"⏱ *Dakika:* `{minute_str}` | *Güven:* {res['confidence']}\n"
+                                f"⚽ *{home_name}* `{res['score']}` *{away_name}*\n"
+                                f"🏆 _{league}_\n"
+                                f"⏱ *Dakika:* `{minute_str}` ({res['period']})\n"
                                 f"━━━━━━━━━━━━━━━━━━\n"
                                 f"🎯 *ANA TAHMİN:* `{res['pick']}`\n"
+                                f"📊 *Güven:* {res['confidence']} ({res['prob']}%)\n"
+                                f"⚠️ *Risk:* {res['risk']}\n"
                                 f"📉 *Oran:* %{odds_drop} Düşüş (Sharp Money)\n"
                                 f"━━━━━━━━━━━━━━━━━━\n\n"
                                 f"🔥 *BASKI ANALİZİ*\n"
                                 f"{bar} `%{res['pressure']}`\n"
                                 f"🚀 *Baskı Yapan:* {res['team']}\n\n"
                                 f"📈 *İSTATİSTİKLER*\n"
-                                f"• Şut: `{stats['home_sot']}-{stats['away_sot']}` | Korner: `{stats['home_corners']}-{stats['away_corners']}`\n"
-                                f"• Hakimiyet: `% {stats['home_poss']}-% {stats['away_poss']}`\n\n"
+                                f"  🥅 Şut: `{stats['home_sot']}-{stats['away_sot']}`\n"
+                                f"  ⚡ T.Şut: `{stats['home_shots']}-{stats['away_shots']}`\n"
+                                f"  🚩 Korner: `{stats['home_corners']}-{stats['away_corners']}`\n"
+                                f"  🎮 Hakimiyet: `%{stats['home_poss']}-%{stats['away_poss']}`\n"
+                                f"{alt_section}\n"
                                 f"🧠 *AI TRADER YORUMU:*\n"
                                 f"_{ai_msg}_\n\n"
-                                f"💎 _ROI Odaklı Profesyonel Algoritma_"
+                                f"💎 _ROI Odaklı Profesyonel Algoritma_\n"
+                                f"⏰ {time.strftime('%H:%M')}"
                             )
-                            await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
-                            history.append({"id": mid, "timestamp": time.time(), "status": "pending", "start_total": res['total_score']})
-                            await manage_history("write", history)
-        except Exception as e: print(f"Hata: {e}")
+                            
+                            try:
+                                await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
+                                history.append({
+                                    "id": mid,
+                                    "timestamp": time.time(),
+                                    "status": "pending",
+                                    "start_total": res['total_score'],
+                                    "match": f"{home_name} vs {away_name}",
+                                    "pick": res['pick']
+                                })
+                                await manage_history("write", history)
+                                print(f"✅ Sinyal Gönderildi: {home_name} vs {away_name} | {res['pick']} | Baskı: %{res['pressure']}")
+                            except Exception as e:
+                                print(f"❌ Mesaj Gönderilemedi: {e}")
+        except Exception as e:
+            print(f"⚠️ Döngü hatası: {e}")
         await asyncio.sleep(150)
-
-# --- BAŞLATICI ---
 
 async def post_init(app):
     asyncio.create_task(signal_monitor(app))
@@ -201,11 +288,8 @@ async def post_init(app):
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-    
-    # Komut Kayıtları (BURASI EKLENDİ)
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("canli", live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
-    
-    print("✅ Bot ve Komutlar Hazır!")
+    print("✅ Bot Hazır!")
     app.run_polling()
