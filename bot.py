@@ -1,6 +1,4 @@
-import os
-import asyncio
-import httpx
+import os, asyncio, httpx
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -13,117 +11,83 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 brain = BettingBrain()
 
-URL = "https://api.sofascore.com/api/v1/sport/football/events/live"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-async def fetch_live_matches():
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+async def fetch_api(url):
+    async with httpx.AsyncClient(timeout=20.0) as client:
         try:
-            response = await client.get(URL, headers=headers)
-            if response.status_code == 200:
-                return response.json().get('events', [])
-            return []
-        except Exception as e:
-            print(f"⚠️ Veri çekme hatası: {e}")
-            return []
+            r = await client.get(url, headers=HEADERS)
+            return r.json() if r.status_code == 200 else {}
+        except: return {}
 
-def get_match_minute(match):
-    """Dakika bilgisini güvenli bir şekilde çeker."""
-    status = match.get('status', {})
-    description = status.get('description', '')
+async def get_stats(match_id):
+    """Maçın detaylı şut ve atak verilerini çeker."""
+    data = await fetch_api(f"https://api.sofascore.com/api/v1/event/{match_id}/statistics")
+    stats = {'home_sot': 0, 'away_sot': 0, 'home_da': 0, 'away_da': 0}
     
-    if description == 'HT': return "İY"
-    if description == 'FT': return "MS"
-    
-    # SofaScore'da canlı dakika 'elapsed' içindedir
-    minute = status.get('elapsed')
-    if minute is not None:
-        return f"{minute}'"
-    
-    return "Canlı"
+    for period in data.get('statistics', []):
+        if period['period'] == 'ALL':
+            for item in period['groups']:
+                for s in item['statisticsItems']:
+                    if s['name'] == 'Shots on target':
+                        stats['home_sot'] = int(s['homeValue']); stats['away_sot'] = int(s['awayValue'])
+                    if s['name'] == 'Dangerous attacks':
+                        stats['home_da'] = int(s['homeValue']); stats['away_da'] = int(s['awayValue'])
+    return stats
 
-# --- KOMUTLAR ---
+def get_min(m):
+    """SofaScore dakika bug'ını çözen fonksiyon."""
+    st = m.get('status', {})
+    if st.get('description') == 'HT': return "İY"
+    # elapsed 0 ise SofaScore'un start timestamp'inden hesapla (opsiyonel)
+    elapsed = st.get('elapsed')
+    return f"{elapsed}'" if elapsed else "1'"
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *VIP Bahis Algoritması Aktif!*\n\n"
-        "/canli - Canlı maçları listeler",
-        parse_mode=ParseMode.MARKDOWN
-    )
+async def live_command(update, context):
+    data = await fetch_api("https://api.sofascore.com/api/v1/sport/football/events/live")
+    events = data.get('events', [])
+    if not events: await update.message.reply_text("Canlı maç yok."); return
 
-async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_chat_action("typing")
-    matches = await fetch_live_matches()
-    
-    if not matches:
-        await update.message.reply_text("📭 Şu an canlı maç bulunamadı.")
-        return
+    msg = "⚽ *CANLI MAÇLAR*\n\n"
+    for m in events[:20]:
+        min_str = get_min(m)
+        h = m['homeTeam'].get('shortName') or m['homeTeam']['name']
+        a = m['awayTeam'].get('shortName') or m['awayTeam']['name']
+        sh = m.get('homeScore', {}).get('current', 0)
+        sa = m.get('awayScore', {}).get('current', 0)
+        msg += f"⏱ `{min_str}` | {h} *{sh}-{sa}* {a}\n"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-    text = "⚽ *GÜNCEL CANLI MAÇLAR*\n\n"
-    
-    for m in matches[:25]:
-        # 'shortName' yoksa normal 'name' kullan, o da yoksa 'Bilinmiyor' yaz (Çökmeyi önler)
-        home = m.get('homeTeam', {}).get('shortName') or m.get('homeTeam', {}).get('name') or "Ev Sahibi"
-        away = m.get('awayTeam', {}).get('shortName') or m.get('awayTeam', {}).get('name') or "Deplasman"
-        
-        score_h = m.get('homeScore', {}).get('current', 0)
-        score_a = m.get('awayScore', {}).get('current', 0)
-        
-        minute_display = get_match_minute(m)
-        
-        text += f"⏱ `{minute_display}` | {home} *{score_h}-{score_a}* {away}\n"
-    
-    text += "\n🔍 _VIP Sinyaller kriterlere uyunca otomatik gönderilir._"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-# --- ARKA PLAN SİNYAL DÖNGÜSÜ ---
-
-async def signal_monitor(application):
-    print("🚀 Sinyal Monitörü Çalışıyor...")
-    sent_signals = set()
-
+async def signal_monitor(app):
+    print("🚀 Monitör başladı..."); sent = set()
     while True:
-        matches = await fetch_live_matches()
-        for match in matches:
-            m_id = match.get('id')
-            if m_id and m_id not in sent_signals:
-                decision = brain.analyze_match(match)
-                if decision.get("is_signal"):
-                    minute_display = get_match_minute(match)
-                    # Takım isimlerini sinyal için de güvenli alalım
-                    h_full = match.get('homeTeam', {}).get('name', 'Ev Sahibi')
-                    a_full = match.get('awayTeam', {}).get('name', 'Deplasman')
-                    
-                    text = (
-                        f"🚨 *VIP SİNYAL* 🚨\n\n"
-                        f"⚽ *MAÇ:* {h_full} vs {a_full}\n"
-                        f"🎯 *TAHMİN:* {decision['pick']}\n"
-                        f"📊 *OLASILIK:* %{decision['prob']:.0f}\n"
-                        f"💰 *ORAN:* {decision['odds']:.2f}\n"
-                        f"📈 *VALUE:* %{decision['value']:.1f}\n"
-                        f"🔥 *GÜVEN:* {decision['confidence']}\n\n"
-                        f"⏱ *Dakika:* {minute_display}\n\n"
-                        f"💸 *STAKE:* {decision['stake']}/10"
+        data = await fetch_api("https://api.sofascore.com/api/v1/sport/football/events/live")
+        for m in data.get('events', []):
+            mid = m['id']; minute = m.get('status', {}).get('elapsed', 0)
+            if mid not in sent and 10 < minute < 85:
+                # Detaylı istatistikleri çek
+                stats = await get_stats(mid)
+                res = brain.analyze_advanced(m, stats, minute)
+                
+                if res['is_signal']:
+                    txt = (
+                        f"🚨 *VIP GOL SİNYALİ* 🚨\n\n"
+                        f"🏟 *MAÇ:* {m['homeTeam']['name']} vs {m['awayTeam']['name']}\n"
+                        f"⏰ *DAKİKA:* {minute}' ({res['period']})\n"
+                        f"🔥 *BASKI GÜCÜ:* %{res['pressure']}\n"
+                        f"🎯 *DURUM:* {res['stats_summary']}\n"
+                        f"🏆 *TAHMİN:* {res['pick']}\n"
+                        f"⭐ *GÜVEN:* {res['confidence']}\n\n"
+                        f"🚀 *BASKIDAKİ TAKIM:* {res['team']}\n\n"
+                        f"💸 *STAKE:* 4/10"
                     )
-                    try:
-                        await application.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.MARKDOWN)
-                        sent_signals.add(m_id)
-                    except Exception as e:
-                        print(f"Sinyal gönderim hatası: {e}")
-        
-        if len(sent_signals) > 1000: sent_signals.clear()
-        await asyncio.sleep(120)
+                    await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
+                    sent.add(mid)
+        await asyncio.sleep(150)
 
-async def post_init(application):
-    asyncio.create_task(signal_monitor(application))
+async def post_init(app): asyncio.create_task(signal_monitor(app))
 
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("canli", live_command))
-    app.add_handler(CommandHandler("live", live_command))
-
-    app.run_polling()
+    application = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    application.add_handler(CommandHandler("canli", live_command))
+    application.run_polling()
