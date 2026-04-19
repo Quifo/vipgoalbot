@@ -1,4 +1,4 @@
-import os, asyncio, httpx, json, time
+import os, asyncio, httpx, json, time, logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -6,6 +6,17 @@ from brain import BettingBrain
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ====================== LOGGING ======================
+logging.basicConfig(
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ====================== CONFIG ======================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -29,7 +40,7 @@ MAX_AI_REQUESTS_PER_MINUTE = 20
 # ====================== GROQ AI ANALİZ ======================
 async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
     if not GROQ_KEY:
-        print("⚠️ GROQ_API_KEY bulunamadı.")
+        logger.warning("GROQ_API_KEY bulunamadı.")
         return "AI analizi şu anda kullanılamıyor."
 
     global last_ai_requests
@@ -37,7 +48,7 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
     last_ai_requests = [t for t in last_ai_requests if now - t < 60]
     
     if len(last_ai_requests) >= MAX_AI_REQUESTS_PER_MINUTE:
-        print("⚠️ AI rate limit aşıldı.")
+        logger.warning("AI rate limit aşıldı.")
         return f"{home} takımının isabetli şut ve baskı üstünlüğü gol beklentisini artırıyor."
 
     last_ai_requests.append(now)
@@ -83,74 +94,93 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
                     data = r.json()
                     comment = data['choices'][0]['message']['content']
                     clean = comment.replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '').strip()
-                    print(f"🧠 Groq AI → {clean[:70]}...")
+                    logger.info(f"AI Yanıtı Başarılı → {home} vs {away}")
                     return clean
 
                 elif r.status_code == 429:
-                    print(f"⚠️ Groq rate limit, bekleniyor...")
+                    logger.warning(f"Groq Rate Limit - Attempt {attempt+1}")
                     await asyncio.sleep(6 * (attempt + 1))
                     continue
                 else:
-                    print(f"⚠️ Groq API Hatası: {r.status_code}")
+                    logger.error(f"Groq API Hatası: {r.status_code}")
                     await asyncio.sleep(4)
         except Exception as e:
-            print(f"⚠️ Groq Hatası: {e}")
+            logger.error(f"Groq Hatası: {e}")
             await asyncio.sleep(5)
 
-    print("⚠️ Groq AI başarısız oldu, varsayılan yanıt.")
+    logger.error("Groq AI tüm denemelerde başarısız oldu.")
     return f"{home} takımının hücum istatistikleri ve baskısı gol olasılığını artırıyor."
 
 
-# ====================== GERÇEK ORAN ÇEKME ======================
+# ====================== GERÇEK ORAN ÇEKME (DÜZELTİLDİ) ======================
 async def get_live_odds(match_id, pick):
-    """Sofascore'dan gerçek bahis oranını çeker"""
     try:
-        url = f"https://www.sofascore.com/api/v1/event/{match_id}/odds/2/all"  # Over/Under market
+        url = f"https://www.sofascore.com/api/v1/event/{match_id}/odds/2/all"
         data = await fetch_api(url)
         
         if not data or 'odds' not in data:
-            return 1.50
+            logger.warning(f"Oran verisi alınamadı, varsayılan: 1.52")
+            return 1.52
+
+        pick_lower = pick.lower()
 
         for bookmaker in data.get('odds', []):
-            if bookmaker.get('name') in ['Pinnacle', 'Bet365', '1xBet', 'Betfair', 'Betsson']:
-                for market in bookmaker.get('markets', []):
-                    if market.get('name') in ['Over/Under', 'Total Goals', 'Both Teams To Score']:
-                        for outcome in market.get('outcomes', []):
-                            name = outcome.get('name', '').lower()
-                            price = float(outcome.get('price', 1.50))
-                            
-                            pick_lower = pick.lower()
-                            if ('üst' in pick_lower or 'over' in pick_lower) and 'over' in name:
-                                return round(price, 2)
-                            if ('kg' in pick_lower or 'both' in pick_lower) and ('both' in name or 'her iki' in name):
-                                return round(price, 2)
-        return 1.50
-    except:
-        return 1.50
+            for market in bookmaker.get('markets', []):
+                for outcome in market.get('outcomes', []):
+                    outcome_name = outcome.get('name', '').lower()
+                    price = float(outcome.get('price', 1.52))
+                    
+                    if ('üst' in pick_lower or 'over' in pick_lower) and any(x in outcome_name for x in ['over', 'üstü', '1.5', '2.5', '3.5']):
+                        logger.info(f"Oran bulundu: {pick} = {price}")
+                        return round(price, 2)
+                    
+                    if ('kg' in pick_lower or 'both' in pick_lower) and any(x in outcome_name for x in ['both', 'her iki', 'kg var', 'yes']):
+                        logger.info(f"Oran bulundu: {pick} = {price}")
+                        return round(price, 2)
+
+        logger.warning(f"Belirtilen bahis türü için oran bulunamadı → {pick}")
+        return 1.52
+
+    except Exception as e:
+        logger.error(f"get_live_odds hatası: {e}")
+        return 1.52
 
 
 # ====================== YARDIMCI FONKSİYONLAR ======================
 async def fetch_api(url):
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        try:
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             r = await client.get(url, headers=HEADERS)
             return r.json() if r.status_code == 200 else {}
-        except:
-            return {}
+    except Exception as e:
+        logger.error(f"API Fetch Hatası: {e}")
+        return {}
 
 def get_real_minute(m):
-    status = m.get('status', {})
-    desc = status.get('description', '').lower()
-    elapsed = status.get('elapsed', 0)
-    if 'ht' in desc: return "İY"
-    if 'ft' in desc: return "MS"
-    if "2nd half" in desc and elapsed < 45: elapsed += 45
-    if elapsed <= 1:
-        start_ts = m.get('startTimestamp')
-        if start_ts:
-            diff = (int(time.time()) - start_ts) // 60
-            elapsed = diff if 0 < diff < 130 else 1
-    return f"{elapsed or 1}'"
+    try:
+        status = m.get('status', {})
+        elapsed = status.get('elapsed', 0)
+        desc = status.get('description', '').lower()
+        period = status.get('type', '')
+
+        if period == 'HT' or 'half time' in desc:
+            return "İY"
+        if period == 'FT' or 'full time' in desc:
+            return "MS"
+
+        if period == '2H' or 'second half' in desc:
+            if elapsed < 45:
+                elapsed += 45
+
+        if elapsed <= 1 and m.get('startTimestamp'):
+            diff = (int(time.time()) - m.get('startTimestamp')) // 60
+            elapsed = max(1, diff)
+
+        return f"{int(elapsed)}'"
+    
+    except Exception as e:
+        logger.error(f"Dakika hesaplama hatası: {e}")
+        return "45'"
 
 async def manage_history(mode="read", data=None):
     url = f"https://api.github.com/gists/{GIST_ID}"
@@ -162,7 +192,8 @@ async def manage_history(mode="read", data=None):
             else:
                 payload = {"files": {"sent_signals.json": {"content": json.dumps(data)}}}
                 await client.patch(url, headers=GIST_HEADERS, json=payload)
-        except:
+        except Exception as e:
+            logger.error(f"Gist Hatası: {e}")
             return [] if mode == "read" else None
 
 async def get_stats(match_id):
@@ -255,13 +286,13 @@ async def result_tracker(app):
                         updated = True
             if updated: 
                 await manage_history("write", history)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Result Tracker Hatası: {e}")
         await asyncio.sleep(600)
 
 
 async def signal_monitor(app):
-    print("🚀 Pro Monitör Başladı... (Groq AI + Gerçek Oran Aktif)")
+    logger.info("🚀 Pro Monitör Başladı... (Düzeltilmiş Dakika + Oran Sistemi)")
     while True:
         try:
             data = await fetch_api(LIVE_URL)
@@ -269,7 +300,7 @@ async def signal_monitor(app):
             history = await manage_history("read")
             sent_ids = [str(x['id']) for x in history]
 
-            print(f"📊 {len(events)} maç taranıyor | Hafızada {len(history)} sinyal")
+            logger.info(f"{len(events)} maç taranıyor | Hafızada {len(history)} sinyal")
 
             for m in events:
                 mid = str(m['id'])
@@ -282,25 +313,19 @@ async def signal_monitor(app):
                 if mid not in sent_ids and 10 < mn_int < 85:
                     stats = await get_stats(mid)
                     if stats:
-                        odds_drop = round(time.time() % 9 + 3, 1)  # eski değişken, kaldırılabilir
-                        res = brain.analyze_advanced(m, stats, mn_int, odds_drop)
+                        res = brain.analyze_advanced(m, stats, mn_int)
                         
                         if res.get('is_signal'):
                             home_name = m['homeTeam']['name']
                             away_name = m['awayTeam']['name']
                             league = m.get('tournament', {}).get('name', 'Bilinmiyor')
                             
-                            print(f"🔍 Sinyal bulundu: {home_name} vs {away_name} ({minute_str})")
-                            
-                            # === GERÇEK ORAN ÇEKME ===
                             real_odds = await get_live_odds(mid, res['pick'])
                             
-                            # Oran filtresi
                             if real_odds < 1.38:
-                                print(f"❌ Oran düşük ({real_odds}), sinyal iptal edildi.")
+                                logger.info(f"Oran düşük ({real_odds}), sinyal iptal edildi - {home_name} vs {away_name}")
                                 continue
 
-                            # AI Yorumu
                             ai_msg = await get_ai_insight(home_name, away_name, stats, res['pick'], res['pressure'], mn_int, res['score'])
                             
                             alt_picks = [p for p in res.get('alt', []) if p[0] != res['pick']]
@@ -346,11 +371,11 @@ async def signal_monitor(app):
                                     "pick": res['pick']
                                 })
                                 await manage_history("write", history)
-                                print(f"✅ Sinyal Gönderildi | Oran: {real_odds}")
+                                logger.info(f"✅ Sinyal Gönderildi | Oran: {real_odds}")
                             except Exception as e:
-                                print(f"❌ Mesaj Gönderilemedi: {e}")
+                                logger.error(f"Mesaj Gönderilemedi: {e}")
         except Exception as e:
-            print(f"⚠️ Döngü hatası: {e}")
+            logger.critical(f"⚠️ Ana Döngü Hatası: {e}")
         
         await asyncio.sleep(180)
 
@@ -365,5 +390,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("canli", live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
-    print("✅ Bot Hazır! (Gerçek Oran + Groq AI Aktif)")
+    logger.info("✅ Bot Hazır! (Düzeltilmiş Dakika + Gerçek Oran Sistemi)")
     app.run_polling()
