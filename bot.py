@@ -21,6 +21,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 GIST_ID = os.getenv("GIST_ID")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 brain = BettingBrain()
 
@@ -36,6 +37,7 @@ MAX_AI_REQUESTS_PER_MINUTE = 20
 # ====================== GROQ AI ======================
 async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
     if not GROQ_KEY:
+        logger.warning("GROQ_API_KEY bulunamadı.")
         return "AI analizi şu anda kullanılamıyor."
 
     global last_ai_requests
@@ -43,6 +45,7 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
     last_ai_requests = [t for t in last_ai_requests if now - t < 60]
     
     if len(last_ai_requests) >= MAX_AI_REQUESTS_PER_MINUTE:
+        logger.warning("AI rate limit aşıldı.")
         return f"{home} takımının isabetli şut ve baskı üstünlüğü gol beklentisini artırıyor."
 
     last_ai_requests.append(now)
@@ -89,46 +92,37 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
     return f"{home} takımının isabetli şut ve baskı puanı gol olasılığını artırıyor."
 
 
-# ====================== GERÇEK ORAN (DÜZELTİLDİ) ======================
-async def get_live_odds(match_id, pick):
-    """Çoklu endpoint ile agresif oran arama"""
-    pick_lower = pick.lower()
-    default_odds = 1.55
+# ====================== THE ODDS API - ORAN ÇEKME ======================
+async def get_live_odds(home, away, pick):
+    if not ODDS_API_KEY:
+        logger.warning("ODDS_API_KEY bulunamadı.")
+        return 1.55
 
-    # Denenecek endpoint'ler
-    endpoints = [
-        f"https://www.sofascore.com/api/v1/event/{match_id}/odds/2/all",  # Over/Under
-        f"https://www.sofascore.com/api/v1/event/{match_id}/odds/1/all",  # 1X2
-        f"https://www.sofascore.com/api/v1/event/{match_id}/odds/3/all"   # Diğer marketler
-    ]
+    try:
+        url = f"https://api.the-odds-api.com/v4/sports/soccer_epl/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h"
+        data = await fetch_api(url)
+        
+        if not data:
+            return 1.55
 
-    for url in endpoints:
-        try:
-            data = await fetch_api(url)
-            if not data or 'odds' not in data:
-                continue
-
-            for bookmaker in data.get('odds', []):
-                for market in bookmaker.get('markets', []):
-                    for outcome in market.get('outcomes', []):
-                        name = outcome.get('name', '').lower()
-                        price = float(outcome.get('price', default_odds))
-
-                        # ÜST bahisleri
-                        if ('üst' in pick_lower or 'over' in pick_lower) and any(x in name for x in ['over', 'üstü', '1.5', '2.5', '3.5', '0.5']):
-                            logger.info(f"✅ Oran bulundu: {pick} = {price} | Match ID: {match_id}")
-                            return round(price, 2)
-
-                        # KG VAR bahisleri
-                        if ('kg' in pick_lower or 'both' in pick_lower) and any(x in name for x in ['both', 'her iki', 'kg var', 'yes', 'evet']):
-                            logger.info(f"✅ Oran bulundu: {pick} = {price} | Match ID: {match_id}")
-                            return round(price, 2)
-
-        except Exception as e:
-            continue
-
-    logger.warning(f"Oran bulunamadı → Match ID: {match_id} | Pick: {pick}")
-    return default_odds
+        for event in data:
+            if home.lower() in event.get('home_team', '').lower() and away.lower() in event.get('away_team', '').lower():
+                for bookmaker in event.get('bookmakers', []):
+                    for market in bookmaker.get('markets', []):
+                        if market.get('key') == 'h2h':
+                            for outcome in market.get('outcomes', []):
+                                name = outcome.get('name', '').lower()
+                                price = float(outcome.get('price', 1.55))
+                                if 'over' in pick.lower() and 'over' in name:
+                                    logger.info(f"✅ Oran bulundu: {pick} = {price}")
+                                    return round(price, 2)
+                                if 'kg' in pick.lower() and 'both' in name:
+                                    logger.info(f"✅ Oran bulundu: {pick} = {price}")
+                                    return round(price, 2)
+        return 1.55
+    except Exception as e:
+        logger.error(f"The Odds API Hatası: {e}")
+        return 1.55
 
 
 # ====================== YARDIMCI FONKSİYONLAR ======================
@@ -137,7 +131,8 @@ async def fetch_api(url):
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             r = await client.get(url, headers=HEADERS)
             return r.json() if r.status_code == 200 else {}
-    except:
+    except Exception as e:
+        logger.error(f"API Fetch Hatası: {e}")
         return {}
 
 def get_real_minute(m):
@@ -166,7 +161,8 @@ async def manage_history(mode="read", data=None):
             else:
                 payload = {"files": {"sent_signals.json": {"content": json.dumps(data)}}}
                 await client.patch(url, headers=GIST_HEADERS, json=payload)
-        except:
+        except Exception as e:
+            logger.error(f"Gist Hatası: {e}")
             return [] if mode == "read" else None
 
 async def get_stats(match_id):
@@ -204,9 +200,14 @@ async def get_stats(match_id):
         return None
 
 
-# ====================== KOMUTLAR ve DÖNGÜLER ======================
+# ====================== KOMUTLAR ======================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 *VIP Pro Trader Bot Aktif!*", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        "🤖 *VIP Pro Trader Bot Aktif!*\n\n"
+        "/canli - Canlı maçları listeler\n"
+        "/kontrol - Sistem denetimi yapar",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_chat_action("typing")
@@ -237,10 +238,20 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     ai_status = "✅ OK" if len(ai_test) > 10 else "❌ HATA"
     
-    report = f"🛡 *BOT DENETİM RAPORU*\n\n🌐 API: {'✅ OK' if api_data else '❌ HATA'}\n💾 Gist: {'✅ OK' if isinstance(gist_data, list) else '❌ HATA'}\n🧠 AI: {ai_status}\n🚀 _Sistem aktif!_"
+    report = (
+        f"🛡 *BOT DENETİM RAPORU*\n\n"
+        f"🌐 API: {'✅ OK' if api_data else '❌ HATA'}\n"
+        f"💾 Gist: {'✅ OK' if isinstance(gist_data, list) else '❌ HATA'}\n"
+        f"🧠 AI: {ai_status}\n"
+        f"📩 İletim: {delivery}\n"
+        f"⚽ Canlı Maç: {len(api_data.get('events', []))}\n"
+        f"📊 Hafızadaki Sinyal: {len(gist_data) if isinstance(gist_data, list) else 0}\n\n"
+        f"🚀 _Sistem aktif!_"
+    )
     await msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
 
 
+# ====================== DÖNGÜLER ======================
 async def result_tracker(app):
     while True:
         try:
@@ -263,7 +274,7 @@ async def result_tracker(app):
 
 
 async def signal_monitor(app):
-    logger.info("🚀 Pro Monitör Başladı...")
+    logger.info("🚀 Pro Monitör Başladı... (The Odds API Aktif)")
     while True:
         try:
             data = await fetch_api(LIVE_URL)
@@ -284,14 +295,67 @@ async def signal_monitor(app):
                     if stats:
                         res = brain.analyze_advanced(m, stats, mn_int)
                         if res.get('is_signal'):
-                            real_odds = await get_live_odds(mid, res['pick'])
+                            home_name = m['homeTeam']['name']
+                            away_name = m['awayTeam']['name']
+                            league = m.get('tournament', {}).get('name', 'Bilinmiyor')
+                            
+                            real_odds = await get_live_odds(home_name, away_name, res['pick'])
+                            
                             if real_odds < 1.38:
+                                logger.info(f"Oran düşük ({real_odds}), sinyal iptal edildi.")
                                 continue
-                            ai_msg = await get_ai_insight(m['homeTeam']['name'], m['awayTeam']['name'], stats, res['pick'], res['pressure'], mn_int, res['score'])
-                            # ... (mesaj gönderme kısmı aynı kalıyor)
-                            # Senin son kodundan kopyala
+
+                            ai_msg = await get_ai_insight(home_name, away_name, stats, res['pick'], res['pressure'], mn_int, res['score'])
+                            
+                            alt_picks = [p for p in res.get('alt', []) if p[0] != res['pick']]
+                            alt_txt = "".join([f"  • {p[0]} (Risk: {p[2]})\n" for p in alt_picks[:3]])
+                            
+                            bar = "🟩" * (res['pressure'] // 10) + "⬜" * (10 - res['pressure'] // 10)
+                            alt_section = f"\n💡 *ALTERNATİF ÖNERİLER*\n{alt_txt}" if alt_txt else ""
+                            
+                            txt = (
+                                f"🚨 *VIP PRO TRADER ANALİZİ* 🚨\n\n"
+                                f"⚽ *{home_name}* `{res['score']}` *{away_name}*\n"
+                                f"🏆 _{league}_\n"
+                                f"⏱ *Dakika:* `{minute_str}` ({res['period']})\n"
+                                f"━━━━━━━━━━━━━━━━━━\n"
+                                f"🎯 *ANA TAHMİN:* `{res['pick']}`\n"
+                                f"📊 *Güven:* {res['confidence']} ({res['prob']}%)\n"
+                                f"⚠️ *Risk:* {res['risk']}\n"
+                                f"📉 *Gerçek Oran:* `{real_odds}`\n"
+                                f"━━━━━━━━━━━━━━━━━━\n\n"
+                                f"🔥 *BASKI ANALİZİ*\n"
+                                f"{bar} `%{res['pressure']}`\n"
+                                f"🚀 *Baskı Yapan:* {res['team']}\n\n"
+                                f"📈 *İSTATİSTİKLER*\n"
+                                f"  🥅 Şut: `{stats['home_sot']}-{stats['away_sot']}`\n"
+                                f"  ⚡ T.Şut: `{stats['home_shots']}-{stats['away_shots']}`\n"
+                                f"  🚩 Korner: `{stats['home_corners']}-{stats['away_corners']}`\n"
+                                f"  🎮 Hakimiyet: `%{stats['home_poss']}-%{stats['away_poss']}`\n"
+                                f"{alt_section}\n"
+                                f"🧠 *AI TRADER YORUMU:*\n"
+                                f"_{ai_msg}_\n\n"
+                                f"💎 _ROI Odaklı Profesyonel Algoritma_\n"
+                                f"⏰ {time.strftime('%H:%M')}"
+                            )
+                            
+                            try:
+                                await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
+                                history.append({
+                                    "id": mid,
+                                    "timestamp": time.time(),
+                                    "status": "pending",
+                                    "start_total": res['total_score'],
+                                    "match": f"{home_name} vs {away_name}",
+                                    "pick": res['pick']
+                                })
+                                await manage_history("write", history)
+                                logger.info(f"✅ Sinyal Gönderildi | Oran: {real_odds}")
+                            except Exception as e:
+                                logger.error(f"Mesaj Gönderilemedi: {e}")
         except Exception as e:
             logger.error(f"Döngü hatası: {e}")
+        
         await asyncio.sleep(180)
 
 
@@ -305,5 +369,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("canli", live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
-    logger.info("✅ Bot Hazır!")
+    logger.info("✅ Bot Hazır! (The Odds API ile Oran Sistemi Aktif)")
     app.run_polling()
