@@ -7,30 +7,29 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ====================== CONFIG ======================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GIST_ID = os.getenv("GIST_ID")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_KEY = os.getenv("GROQ_API_KEY")
 
 brain = BettingBrain()
 
-# ====================== GLOBAL AYARLAR ======================
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 GIST_HEADERS = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
 
 LIVE_URL = "https://www.sofascore.com/api/v1/sport/football/events/live"
 STATS_URL = "https://www.sofascore.com/api/v1/event/{}/statistics"
 
-# ====================== GLOBAL AI RATE LIMITER ======================
+# Groq Rate Limiter
 last_ai_requests = []
-MAX_AI_REQUESTS_PER_MINUTE = 8
+MAX_AI_REQUESTS_PER_MINUTE = 20
 
-
-# ====================== GELİŞMİŞ AI ANALİZİ ======================
+# ====================== GROQ AI ANALİZ ======================
 async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
-    if not GEMINI_KEY:
-        print("⚠️ GEMINI_KEY bulunamadı.")
+    if not GROQ_KEY:
+        print("⚠️ GROQ_API_KEY bulunamadı.")
         return "AI analizi şu anda kullanılamıyor."
 
     # Rate Limiter
@@ -44,12 +43,11 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
 
     last_ai_requests.append(now)
 
-    # Şu anda en çok çalışan modeller (sırayla denenecek)
-    models_to_try = [
-        "gemini-1.5-flash",           # En klasik ve stabil
-        "gemini-1.5-flash-002",       # Yeni versiyon
-        "gemini-2.0-flash-exp"        # Deneysel
-    ]
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_KEY}",
+        "Content-Type": "application/json"
+    }
 
     prompt_text = (
         f"Sen bir profesyonel bahis analistisin. Şu maçı kısaca analiz et:\n"
@@ -66,51 +64,41 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
         f"- Maksimum 2 cümle yaz\n"
         f"- Neden mantıklı olduğunu açıkla\n"
         f"- Özel karakter kullanma (* _ `)\n"
-        f"- Banko, kesin gibi kelimeler kullanma"
+        f"- Banko, kesin gibi kelimeler kullanma\n"
+        f"- Sadece veri bazlı yorum yap"
     )
 
     payload = {
-        "contents": [{"parts": [{"text": prompt_text}]}],
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 150,
-        }
+        "model": "llama-3.1-8b-instant",
+        "messages": [{"role": "user", "content": prompt_text}],
+        "temperature": 0.7,
+        "max_tokens": 150
     }
 
-    for model in models_to_try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-        
-        for attempt in range(2):
-            try:
-                async with httpx.AsyncClient(timeout=14.0) as client:
-                    r = await client.post(url, json=payload)
-                    
-                    if r.status_code == 200:
-                        data = r.json()
-                        comment = data['candidates'][0]['content']['parts'][0]['text']
-                        clean = comment.replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '').strip()
-                        print(f"🧠 AI [{model}] → {clean[:65]}...")
-                        return clean
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.post(url, json=payload, headers=headers)
+                
+                if r.status_code == 200:
+                    data = r.json()
+                    comment = data['choices'][0]['message']['content']
+                    clean = comment.replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '').strip()
+                    print(f"🧠 Groq AI → {clean[:70]}...")
+                    return clean
 
-                    elif r.status_code == 404:
-                        print(f"⚠️ Model '{model}' bu key'de bulunamadı.")
-                        break  # Bir sonraki modele geç
+                elif r.status_code == 429:
+                    print(f"⚠️ Groq rate limit, bekleniyor...")
+                    await asyncio.sleep(6 * (attempt + 1))
+                    continue
+                else:
+                    print(f"⚠️ Groq API Hatası: {r.status_code}")
+                    await asyncio.sleep(4)
+        except Exception as e:
+            print(f"⚠️ Groq Hatası: {e}")
+            await asyncio.sleep(5)
 
-                    elif r.status_code == 429:
-                        print(f"⚠️ Rate limit ({model})")
-                        await asyncio.sleep(8)
-                        continue
-
-                    else:
-                        print(f"⚠️ {model} | Status: {r.status_code} | {r.text[:150]}")
-                        await asyncio.sleep(4)
-
-            except Exception as e:
-                print(f"⚠️ Bağlantı hatası ({model}): {e}")
-                await asyncio.sleep(5)
-
-    # Hiçbiri çalışmadıysa
-    print("⚠️ Tüm modeller denendi, AI devre dışı kaldı.")
+    print("⚠️ Groq AI başarısız oldu, varsayılan yanıt.")
     return f"{home} takımının hücum istatistikleri ve baskısı gol olasılığını artırıyor."
 
 
@@ -129,15 +117,13 @@ def get_real_minute(m):
     elapsed = status.get('elapsed', 0)
     if 'ht' in desc: return "İY"
     if 'ft' in desc: return "MS"
-    if "2nd half" in desc and elapsed < 45: 
-        elapsed += 45
+    if "2nd half" in desc and elapsed < 45: elapsed += 45
     if elapsed <= 1:
         start_ts = m.get('startTimestamp')
         if start_ts:
             diff = (int(time.time()) - start_ts) // 60
             elapsed = diff if 0 < diff < 130 else 1
     return f"{elapsed or 1}'"
-
 
 async def manage_history(mode="read", data=None):
     url = f"https://api.github.com/gists/{GIST_ID}"
@@ -152,7 +138,6 @@ async def manage_history(mode="read", data=None):
         except:
             return [] if mode == "read" else None
 
-
 async def get_stats(match_id):
     url = STATS_URL.format(match_id)
     data = await fetch_api(url)
@@ -166,22 +151,16 @@ async def get_stats(match_id):
                         n = i['name']
                         hv = int(str(i.get('homeValue', 0)).replace('%',''))
                         av = int(str(i.get('awayValue', 0)).replace('%',''))
-                        if n == 'Shots on target': 
-                            s['home_sot'], s['away_sot'], s['has'] = hv, av, True
-                        elif n == 'Total shots': 
-                            s['home_shots'], s['away_shots'], s['has'] = hv, av, True
-                        elif n == 'Corner kicks': 
-                            s['home_corners'], s['away_corners'] = hv, av
-                        elif n == 'Ball possession': 
-                            s['home_poss'], s['away_poss'] = hv, av
+                        if n == 'Shots on target': s['home_sot'], s['away_sot'], s['has'] = hv, av, True
+                        elif n == 'Total shots': s['home_shots'], s['away_shots'], s['has'] = hv, av, True
+                        elif n == 'Corner kicks': s['home_corners'], s['away_corners'] = hv, av
+                        elif n == 'Ball possession': s['home_poss'], s['away_poss'] = hv, av
         return s if s['has'] else None
     except:
         return None
 
 
 # ====================== KOMUTLAR ======================
-# ... (start_command, live_command, control_command aynı kalıyor) ...
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *VIP Pro Trader Bot Aktif!*\n\n"
@@ -217,7 +196,7 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except: 
         delivery = "❌ HATA"
     
-    ai_status = "✅ OK" if len(ai_test) > 10 and "devre dışı" not in ai_test.lower() else "❌ HATA"
+    ai_status = "✅ OK" if len(ai_test) > 10 else "❌ HATA"
     
     report = (
         f"🛡 *BOT DENETİM RAPORU*\n\n"
@@ -233,9 +212,6 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ====================== DÖNGÜLER ======================
-# result_tracker ve signal_monitor fonksiyonları aynı kalıyor...
-# Sadece signal_monitor içindeki sleep süresini 180'e çıkarmayı öneririm.
-
 async def result_tracker(app):
     while True:
         try:
@@ -250,7 +226,6 @@ async def result_tracker(app):
                         sig['status'] = 'WIN ✅' if is_win else 'LOSS ❌'
                         sig['final_score'] = f"{ev['homeScore']['current']}-{ev['awayScore']['current']}"
                         updated = True
-                        print(f"📋 Sonuç: {sig.get('match','?')} -> {sig['status']} ({sig['final_score']})")
             if updated: 
                 await manage_history("write", history)
         except:
@@ -259,14 +234,14 @@ async def result_tracker(app):
 
 
 async def signal_monitor(app):
-    print("🚀 Pro Monitör Başladı...")
+    print("🚀 Pro Monitör Başladı... (Groq AI Aktif)")
     while True:
         try:
             data = await fetch_api(LIVE_URL)
             events = data.get('events', [])
             history = await manage_history("read")
             sent_ids = [str(x['id']) for x in history]
-            
+
             print(f"📊 {len(events)} maç taranıyor | Hafızada {len(history)} sinyal")
 
             for m in events:
@@ -284,24 +259,16 @@ async def signal_monitor(app):
                         res = brain.analyze_advanced(m, stats, mn_int, odds_drop)
                         
                         if res.get('is_signal'):
-                            # ... (mevcut kodun geri kalanı tamamen aynı) ...
                             home_name = m['homeTeam']['name']
                             away_name = m['awayTeam']['name']
                             league = m.get('tournament', {}).get('name', 'Bilinmiyor')
                             
                             print(f"🔍 Sinyal bulundu: {home_name} vs {away_name} ({minute_str})")
                             
-                            ai_msg = await get_ai_insight(
-                                home_name, away_name, stats, 
-                                res['pick'], res['pressure'], mn_int, res['score']
-                            )
+                            ai_msg = await get_ai_insight(home_name, away_name, stats, res['pick'], res['pressure'], mn_int, res['score'])
                             
-                            # Geri kalan kod (alt_picks, bar, txt vs.) tamamen aynı kalıyor...
                             alt_picks = [p for p in res.get('alt', []) if p[0] != res['pick']]
-                            alt_txt = ""
-                            if alt_picks:
-                                for p in alt_picks[:3]:
-                                    alt_txt += f"  • {p[0]} (Risk: {p[2]})\n"
+                            alt_txt = "".join([f"  • {p[0]} (Risk: {p[2]})\n" for p in alt_picks[:3]])
                             
                             bar = "🟩" * (res['pressure'] // 10) + "⬜" * (10 - res['pressure'] // 10)
                             alt_section = f"\n💡 *ALTERNATİF ÖNERİLER*\n{alt_txt}" if alt_txt else ""
@@ -315,7 +282,7 @@ async def signal_monitor(app):
                                 f"🎯 *ANA TAHMİN:* `{res['pick']}`\n"
                                 f"📊 *Güven:* {res['confidence']} ({res['prob']}%)\n"
                                 f"⚠️ *Risk:* {res['risk']}\n"
-                                f"📉 *Oran:* %{odds_drop} Düşüş (Sharp Money)\n"
+                                f"📉 *Oran:* %{odds_drop} Düşüş\n"
                                 f"━━━━━━━━━━━━━━━━━━\n\n"
                                 f"🔥 *BASKI ANALİZİ*\n"
                                 f"{bar} `%{res['pressure']}`\n"
@@ -343,13 +310,12 @@ async def signal_monitor(app):
                                     "pick": res['pick']
                                 })
                                 await manage_history("write", history)
-                                print(f"✅ Sinyal Gönderildi: {home_name} vs {away_name} | {res['pick']} | Baskı: %{res['pressure']}")
                             except Exception as e:
                                 print(f"❌ Mesaj Gönderilemedi: {e}")
         except Exception as e:
             print(f"⚠️ Döngü hatası: {e}")
         
-        await asyncio.sleep(180)   # 150 → 180 yaptım (daha az yük)
+        await asyncio.sleep(180)  # 3 dakikada bir tarama
 
 
 async def post_init(app):
@@ -362,5 +328,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("canli", live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
-    print("✅ Bot Hazır!")
+    print("✅ Bot Hazır! (Groq AI Aktif)")
     app.run_polling()
