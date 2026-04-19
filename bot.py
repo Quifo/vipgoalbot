@@ -327,7 +327,6 @@ async def signal_monitor(app):
                             bar = "🟩" * (res['pressure'] // 10) + "⬜" * (10 - res['pressure'] // 10)
                             alt_section = f"\n💡 *ALTERNATİF ÖNERİLER*\n{alt_txt}" if alt_txt else ""
 
-                           period_emoji = "1️⃣" if res['period'] == "1. YARI" else "2️⃣"
 
 txt = (
     f"📡 *SİNYAL* | {time.strftime('%H:%M')}\n"
