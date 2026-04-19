@@ -201,7 +201,7 @@ async def get_stats(match_id):
     data = await fetch_api(url)
     
     if not data or 'statistics' not in data:
-        logger.debug(f"İstatistik verisi yok → Match ID: {match_id}")
+        logger.debug(f"İstatistik verisi yok (404) → Match ID: {match_id}")
         return None
 
     s = {'home_sot':0, 'away_sot':0, 'home_shots':0, 'away_shots':0, 
@@ -212,14 +212,18 @@ async def get_stats(match_id):
             if p.get('period') == 'ALL':
                 for g in p.get('groups', []):
                     for i in g.get('statisticsItems', []):
-                        n = i['name']
-                        # Ondalıklı değerleri de kabul et
-                        home_str = str(i.get('homeValue', 0)).replace('%', '').strip()
-                        away_str = str(i.get('awayValue', 0)).replace('%', '').strip()
+                        n = i.get('name')
+                        home_val = i.get('homeValue')
+                        away_val = i.get('awayValue')
                         
-                        hv = int(float(home_str)) if home_str.replace('.', '').isdigit() else 0
-                        av = int(float(away_str)) if away_str.replace('.', '').isdigit() else 0
-                        
+                        # GÜVENLİ DÖNÜŞÜM
+                        try:
+                            hv = int(float(str(home_val).replace('%', '').strip())) if home_val is not None else 0
+                            av = int(float(str(away_val).replace('%', '').strip())) if away_val is not None else 0
+                        except (ValueError, TypeError, AttributeError):
+                            logger.debug(f"Veri dönüşüm atlandı → {n}: home={home_val}, away={away_val}")
+                            hv = av = 0
+
                         if n == 'Shots on target':
                             s['home_sot'], s['away_sot'], s['has'] = hv, av, True
                         elif n == 'Total shots':
