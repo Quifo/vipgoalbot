@@ -122,39 +122,6 @@ def _fallback_comment(home, away, stats, pick, pressure):
     import random
     return random.choice(comments)
 
-    payload = {
-        "model": "llama-3.1-8b-instant",
-        "messages": [{"role": "user", "content": prompt_text}],
-        "temperature": 0.7,
-        "max_tokens": 150
-    }
-
-    for attempt in range(3):
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.post(url, json=payload, headers=headers)
-
-                if r.status_code == 200:
-                    data = r.json()
-                    comment = data['choices'][0]['message']['content']
-                    clean = comment.replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '').strip()
-                    print(f"🧠 Groq AI → {clean[:70]}...")
-                    return clean
-
-                elif r.status_code == 429:
-                    print(f"⚠️ Groq rate limit, bekleniyor...")
-                    await asyncio.sleep(6 * (attempt + 1))
-                    continue
-                else:
-                    print(f"⚠️ Groq API Hatası: {r.status_code}")
-                    await asyncio.sleep(4)
-        except Exception as e:
-            print(f"⚠️ Groq Hatası: {e}")
-            await asyncio.sleep(5)
-
-    print("⚠️ Groq AI başarısız oldu, varsayılan yanıt.")
-    return f"{home} takımının hücum istatistikleri ve baskısı gol olasılığını artırıyor."
-
 
 # ====================== YARDIMCI FONKSİYONLAR ======================
 async def fetch_api(url):
@@ -327,32 +294,34 @@ async def signal_monitor(app):
                             bar = "🟩" * (res['pressure'] // 10) + "⬜" * (10 - res['pressure'] // 10)
                             alt_section = f"\n💡 *ALTERNATİF ÖNERİLER*\n{alt_txt}" if alt_txt else ""
 
+                            period_emoji = "1️⃣" if res['period'] == "1. YARI" else "2️⃣"
 
-txt = (
-    f"📡 *SİNYAL* | {time.strftime('%H:%M')}\n"
-    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-    f"⚽ *{home_name}* `{res['score']}` *{away_name}*\n"
-    f"🏆 {league}\n"
-    f"⏱ `{minute_str}` {period_emoji} {res['period']}\n"
-    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-    f"🎯 *TAHMİN:* `{res['pick']}`\n"
-    f"📊 *Güven:* {res['confidence']} `{res['prob']}%`\n"
-    f"⚠️ *Risk:* `{res['risk']}`\n"
-    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-    f"📈 *İSTATİSTİKLER*\n"
-    f"┌ 🥅 İsabetli Şut: `{stats['home_sot']} - {stats['away_sot']}`\n"
-    f"├ ⚡ Toplam Şut:  `{stats['home_shots']} - {stats['away_shots']}`\n"
-    f"├ 🚩 Korner:     `{stats['home_corners']} - {stats['away_corners']}`\n"
-    f"└ 🎮 Hakimiyet:  `%{stats['home_poss']} - %{stats['away_poss']}`\n"
-    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-    f"🔥 *BASKI:* {bar} `%{res['pressure']}`\n"
-    f"👊 *Üstün Taraf:* {res['team']}\n"
-    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-    f"🧠 *ANALİZ:* _{ai_msg}_\n"
-    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-    f"{alt_section}"
-    f"💎 _VIP Pro Trader_"
-)
+                            txt = (
+                                f"📡 *SİNYAL* | {time.strftime('%H:%M')}\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"⚽ *{home_name}* `{res['score']}` *{away_name}*\n"
+                                f"🏆 {league}\n"
+                                f"⏱ `{minute_str}` {period_emoji} {res['period']}\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"🎯 *TAHMİN:* `{res['pick']}`\n"
+                                f"📊 *Güven:* {res['confidence']} `{res['prob']}%`\n"
+                                f"⚠️ *Risk:* `{res['risk']}`\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"📈 *İSTATİSTİKLER*\n"
+                                f"┌ 🥅 İsabetli Şut: `{stats['home_sot']} - {stats['away_sot']}`\n"
+                                f"├ ⚡ Toplam Şut:  `{stats['home_shots']} - {stats['away_shots']}`\n"
+                                f"├ 🚩 Korner:     `{stats['home_corners']} - {stats['away_corners']}`\n"
+                                f"└ 🎮 Hakimiyet:  `%{stats['home_poss']} - %{stats['away_poss']}`\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"🔥 *BASKI:* {bar} `%{res['pressure']}`\n"
+                                f"👊 *Üstün Taraf:* {res['team']}\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"🧠 *ANALİZ:* _{ai_msg}_\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"{alt_section}"
+                                f"💎 _VIP Pro Trader_"
+                            )
+
                             try:
                                 await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
                                 history.append({
@@ -393,7 +362,7 @@ async def post_shutdown(app):
     print("🛑 Arka plan görevleri durduruldu.")
 
 
-def main():
+if __name__ == "__main__":
     if not TOKEN:
         print("❌ TELEGRAM_TOKEN bulunamadı. Bot durduruluyor.")
         sys.exit(1)
@@ -406,21 +375,6 @@ def main():
         .build()
     )
 
-if __name__ == "__main__":
-    import sys
-    
-    app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .post_init(post_init)
-        # ✅ Conflict önleyici ayarlar
-        .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(30)
-        .pool_timeout(30)
-        .build()
-    )
-    
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("canli", live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
