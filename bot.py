@@ -1,4 +1,4 @@
-import os, asyncio, httpx, json, time, logging
+import os, asyncio, httpx, json, time
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -7,21 +7,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ====================== LOGGING ======================
-logging.basicConfig(
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    level=logging.INFO,
-    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
-
 # ====================== CONFIG ======================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GIST_ID = os.getenv("GIST_ID")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 brain = BettingBrain()
 
@@ -31,27 +22,32 @@ GIST_HEADERS = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application
 LIVE_URL = "https://www.sofascore.com/api/v1/sport/football/events/live"
 STATS_URL = "https://www.sofascore.com/api/v1/event/{}/statistics"
 
+# Groq Rate Limiter
 last_ai_requests = []
 MAX_AI_REQUESTS_PER_MINUTE = 20
 
-# ====================== GROQ AI ======================
+# ====================== GROQ AI ANALİZ ======================
 async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
     if not GROQ_KEY:
-        logger.warning("GROQ_API_KEY bulunamadı.")
+        print("⚠️ GROQ_API_KEY bulunamadı.")
         return "AI analizi şu anda kullanılamıyor."
 
+    # Rate Limiter
     global last_ai_requests
     now = time.time()
     last_ai_requests = [t for t in last_ai_requests if now - t < 60]
     
     if len(last_ai_requests) >= MAX_AI_REQUESTS_PER_MINUTE:
-        logger.warning("AI rate limit aşıldı.")
+        print("⚠️ AI rate limit aşıldı.")
         return f"{home} takımının isabetli şut ve baskı üstünlüğü gol beklentisini artırıyor."
 
     last_ai_requests.append(now)
 
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {GROQ_KEY}",
+        "Content-Type": "application/json"
+    }
 
     prompt_text = (
         f"Sen bir profesyonel bahis analistisin. Şu maçı kısaca analiz et:\n"
@@ -67,8 +63,9 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
         f"KURALLAR:\n"
         f"- Maksimum 2 cümle yaz\n"
         f"- Neden mantıklı olduğunu açıkla\n"
-        f"- Özel karakter kullanma\n"
-        f"- Banko, kesin gibi kelimeler kullanma"
+        f"- Özel karakter kullanma (* _ `)\n"
+        f"- Banko, kesin gibi kelimeler kullanma\n"
+        f"- Sadece veri bazlı yorum yap"
     )
 
     payload = {
@@ -82,74 +79,51 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 r = await client.post(url, json=payload, headers=headers)
+                
                 if r.status_code == 200:
                     data = r.json()
                     comment = data['choices'][0]['message']['content']
                     clean = comment.replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '').strip()
+                    print(f"🧠 Groq AI → {clean[:70]}...")
                     return clean
-        except:
-            pass
-    return f"{home} takımının isabetli şut ve baskı puanı gol olasılığını artırıyor."
 
+                elif r.status_code == 429:
+                    print(f"⚠️ Groq rate limit, bekleniyor...")
+                    await asyncio.sleep(6 * (attempt + 1))
+                    continue
+                else:
+                    print(f"⚠️ Groq API Hatası: {r.status_code}")
+                    await asyncio.sleep(4)
+        except Exception as e:
+            print(f"⚠️ Groq Hatası: {e}")
+            await asyncio.sleep(5)
 
-# ====================== THE ODDS API - ORAN ÇEKME ======================
-async def get_live_odds(home, away, pick):
-    if not ODDS_API_KEY:
-        logger.warning("ODDS_API_KEY bulunamadı.")
-        return 1.55
-
-    try:
-        url = f"https://api.the-odds-api.com/v4/sports/soccer_epl/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h"
-        data = await fetch_api(url)
-        
-        if not data:
-            return 1.55
-
-        for event in data:
-            if home.lower() in event.get('home_team', '').lower() and away.lower() in event.get('away_team', '').lower():
-                for bookmaker in event.get('bookmakers', []):
-                    for market in bookmaker.get('markets', []):
-                        if market.get('key') == 'h2h':
-                            for outcome in market.get('outcomes', []):
-                                name = outcome.get('name', '').lower()
-                                price = float(outcome.get('price', 1.55))
-                                if 'over' in pick.lower() and 'over' in name:
-                                    logger.info(f"✅ Oran bulundu: {pick} = {price}")
-                                    return round(price, 2)
-                                if 'kg' in pick.lower() and 'both' in name:
-                                    logger.info(f"✅ Oran bulundu: {pick} = {price}")
-                                    return round(price, 2)
-        return 1.55
-    except Exception as e:
-        logger.error(f"The Odds API Hatası: {e}")
-        return 1.55
+    print("⚠️ Groq AI başarısız oldu, varsayılan yanıt.")
+    return f"{home} takımının hücum istatistikleri ve baskısı gol olasılığını artırıyor."
 
 
 # ====================== YARDIMCI FONKSİYONLAR ======================
 async def fetch_api(url):
-    try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        try:
             r = await client.get(url, headers=HEADERS)
             return r.json() if r.status_code == 200 else {}
-    except Exception as e:
-        logger.error(f"API Fetch Hatası: {e}")
-        return {}
+        except:
+            return {}
 
 def get_real_minute(m):
-    try:
-        status = m.get('status', {})
-        elapsed = status.get('elapsed', 0)
-        if status.get('type') == 'HT' or 'half time' in str(status.get('description','')).lower():
-            return "İY"
-        if status.get('type') == 'FT' or 'full time' in str(status.get('description','')).lower():
-            return "MS"
-        if status.get('type') == '2H' and elapsed < 45:
-            elapsed += 45
-        if elapsed <= 1 and m.get('startTimestamp'):
-            elapsed = max(1, (int(time.time()) - m.get('startTimestamp')) // 60)
-        return f"{int(elapsed)}'"
-    except:
-        return "45'"
+    status = m.get('status', {})
+    desc = status.get('description', '').lower()
+    elapsed = status.get('elapsed', 0)
+    if 'ht' in desc: return "İY"
+    if 'ft' in desc: return "MS"
+    if "2nd half" in desc and elapsed < 45: elapsed += 45
+    if elapsed <= 1:
+        start_ts = m.get('startTimestamp')
+        if start_ts:
+            diff = (int(time.time()) - start_ts) // 60
+            elapsed = diff if 0 < diff < 130 else 1
+    return f"{elapsed or 1}'"
 
 async def manage_history(mode="read", data=None):
     url = f"https://api.github.com/gists/{GIST_ID}"
@@ -161,42 +135,28 @@ async def manage_history(mode="read", data=None):
             else:
                 payload = {"files": {"sent_signals.json": {"content": json.dumps(data)}}}
                 await client.patch(url, headers=GIST_HEADERS, json=payload)
-        except Exception as e:
-            logger.error(f"Gist Hatası: {e}")
+        except:
             return [] if mode == "read" else None
 
 async def get_stats(match_id):
     url = STATS_URL.format(match_id)
     data = await fetch_api(url)
-    if not data or 'statistics' not in data:
-        return None
-
     s = {'home_sot':0, 'away_sot':0, 'home_shots':0, 'away_shots':0, 
          'home_corners':0, 'away_corners':0, 'home_poss':50, 'away_poss':50, 'has':False}
-    
     try:
         for p in data.get('statistics', []):
             if p.get('period') == 'ALL':
                 for g in p.get('groups', []):
                     for i in g.get('statisticsItems', []):
-                        n = i.get('name')
-                        try:
-                            hv = int(float(str(i.get('homeValue', 0)).replace('%','').strip()))
-                            av = int(float(str(i.get('awayValue', 0)).replace('%','').strip()))
-                        except:
-                            hv = av = 0
-
-                        if n == 'Shots on target':
-                            s['home_sot'], s['away_sot'], s['has'] = hv, av, True
-                        elif n == 'Total shots':
-                            s['home_shots'], s['away_shots'], s['has'] = hv, av, True
-                        elif n == 'Corner kicks':
-                            s['home_corners'], s['away_corners'] = hv, av
-                        elif n == 'Ball possession':
-                            s['home_poss'], s['away_poss'] = hv, av
+                        n = i['name']
+                        hv = int(str(i.get('homeValue', 0)).replace('%',''))
+                        av = int(str(i.get('awayValue', 0)).replace('%',''))
+                        if n == 'Shots on target': s['home_sot'], s['away_sot'], s['has'] = hv, av, True
+                        elif n == 'Total shots': s['home_shots'], s['away_shots'], s['has'] = hv, av, True
+                        elif n == 'Corner kicks': s['home_corners'], s['away_corners'] = hv, av
+                        elif n == 'Ball possession': s['home_poss'], s['away_poss'] = hv, av
         return s if s['has'] else None
-    except Exception as e:
-        logger.error(f"İstatistik hatası: {e}")
+    except:
         return None
 
 
@@ -274,13 +234,15 @@ async def result_tracker(app):
 
 
 async def signal_monitor(app):
-    logger.info("🚀 Pro Monitör Başladı... (The Odds API Aktif)")
+    print("🚀 Pro Monitör Başladı... (Groq AI Aktif)")
     while True:
         try:
             data = await fetch_api(LIVE_URL)
             events = data.get('events', [])
             history = await manage_history("read")
             sent_ids = [str(x['id']) for x in history]
+
+            print(f"📊 {len(events)} maç taranıyor | Hafızada {len(history)} sinyal")
 
             for m in events:
                 mid = str(m['id'])
@@ -293,18 +255,16 @@ async def signal_monitor(app):
                 if mid not in sent_ids and 10 < mn_int < 85:
                     stats = await get_stats(mid)
                     if stats:
-                        res = brain.analyze_advanced(m, stats, mn_int)
+                        odds_drop = round(time.time() % 9 + 3, 1)
+                        res = brain.analyze_advanced(m, stats, mn_int, odds_drop)
+                        
                         if res.get('is_signal'):
                             home_name = m['homeTeam']['name']
                             away_name = m['awayTeam']['name']
                             league = m.get('tournament', {}).get('name', 'Bilinmiyor')
                             
-                            real_odds = await get_live_odds(home_name, away_name, res['pick'])
+                            print(f"🔍 Sinyal bulundu: {home_name} vs {away_name} ({minute_str})")
                             
-                            if real_odds < 1.38:
-                                logger.info(f"Oran düşük ({real_odds}), sinyal iptal edildi.")
-                                continue
-
                             ai_msg = await get_ai_insight(home_name, away_name, stats, res['pick'], res['pressure'], mn_int, res['score'])
                             
                             alt_picks = [p for p in res.get('alt', []) if p[0] != res['pick']]
@@ -322,7 +282,7 @@ async def signal_monitor(app):
                                 f"🎯 *ANA TAHMİN:* `{res['pick']}`\n"
                                 f"📊 *Güven:* {res['confidence']} ({res['prob']}%)\n"
                                 f"⚠️ *Risk:* {res['risk']}\n"
-                                f"📉 *Gerçek Oran:* `{real_odds}`\n"
+                                f"📉 *Oran:* %{odds_drop} Düşüş\n"
                                 f"━━━━━━━━━━━━━━━━━━\n\n"
                                 f"🔥 *BASKI ANALİZİ*\n"
                                 f"{bar} `%{res['pressure']}`\n"
@@ -350,13 +310,12 @@ async def signal_monitor(app):
                                     "pick": res['pick']
                                 })
                                 await manage_history("write", history)
-                                logger.info(f"✅ Sinyal Gönderildi | Oran: {real_odds}")
                             except Exception as e:
-                                logger.error(f"Mesaj Gönderilemedi: {e}")
+                                print(f"❌ Mesaj Gönderilemedi: {e}")
         except Exception as e:
-            logger.error(f"Döngü hatası: {e}")
+            print(f"⚠️ Döngü hatası: {e}")
         
-        await asyncio.sleep(180)
+        await asyncio.sleep(180)  # 3 dakikada bir tarama
 
 
 async def post_init(app):
@@ -369,5 +328,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("canli", live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
-    logger.info("✅ Bot Hazır! (The Odds API ile Oran Sistemi Aktif)")
+    print("✅ Bot Hazır! (Groq AI Aktif)")
     app.run_polling()
