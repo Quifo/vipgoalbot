@@ -1,7 +1,7 @@
 class BettingBrain:
     def __init__(self):
         self.MIN_TOTAL_SHOTS = 6
-        self.MIN_PRESSURE = 38      # Biraz yükselttim
+        self.MIN_PRESSURE = 38
 
     def calculate_pressure(self, stats, minute):
         if minute <= 0: 
@@ -12,10 +12,9 @@ class BettingBrain:
         corners = stats.get('corners', 0)
         poss = stats.get('poss', 50)
 
-        # Daha dengeli ve dakikaya duyarlı formül
         base_score = (sot * 14) + (total_shots * 3.5) + (corners * 5.5)
         possession_bonus = max(0, poss - 52) * 0.9
-        minute_factor = min(1.8, minute / 35)   # Maç ilerledikçe baskı daha değerli
+        minute_factor = min(1.8, minute / 35)
 
         score = (base_score + possession_bonus) * minute_factor
         return min(100, int(score))
@@ -45,6 +44,7 @@ class BettingBrain:
         a_s = m.get('awayScore', {}).get('current', 0)
         curr_score = h_s + a_s
 
+        # Bahis önerileri
         picks = []
         period = "1. YARI" if minute <= 40 else "2. YARI"
 
@@ -71,12 +71,34 @@ class BettingBrain:
 
         # En iyi pick
         best = max(picks, key=lambda x: x[1])
-        
-        # === YENİ: ORAN FİLTRESİ ===
+
+        # === ORAN FİLTRESİ ===
         if best[1] < 1.38:
             return {"is_signal": False}
 
-        conf = "🔥 ELITE" if final_p >= 78 else ("⭐ YÜKSEK" if final_p >= 60 else "📊 ORTA")
+        # ====================== GERÇEKÇİ GÜVEN YÜZDESİ ======================
+        sot_diff = abs(stats['home_sot'] - stats['away_sot'])
+        shot_diff = abs(stats['home_shots'] - stats['away_shots'])
+        corner_diff = abs(stats['home_corners'] - stats['away_corners'])
+
+        # Daha mantıklı olasılık hesabı
+        base_prob = final_p * 0.72                    # Baskı ana etken
+        shot_bonus = shot_diff * 2.2
+        sot_bonus = sot_diff * 5.5
+        corner_bonus = corner_diff * 1.8
+
+        prob = int(base_prob + shot_bonus + sot_bonus + corner_bonus)
+        prob = max(54, min(92, prob))                 # %54 - %92 arası sınırlandı
+
+        # Güven seviyesi metni
+        if prob >= 85:
+            conf = "🔥 ELITE"
+        elif prob >= 75:
+            conf = "⭐ ÇOK GÜVENİLİR"
+        elif prob >= 65:
+            conf = "✅ YÜKSEK"
+        else:
+            conf = "📊 ORTA"
 
         return {
             "is_signal": True,
@@ -86,7 +108,7 @@ class BettingBrain:
             "pick": best[0],
             "confidence": conf,
             "risk": best[2],
-            "prob": int(best[1] * 100),
+            "prob": prob,                    # ← Artık %92'yi geçmeyecek
             "alt": picks,
             "score": f"{h_s}-{a_s}",
             "total_score": curr_score,
