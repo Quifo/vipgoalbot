@@ -355,23 +355,29 @@ def main():
         .build()
     )
 
+if __name__ == "__main__":
+    import sys
+    
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(post_init)
+        # ✅ Conflict önleyici ayarlar
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
+    
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("canli", live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
-
+    
     print("✅ Bot Hazır! (Groq AI Aktif)")
-
-    # drop_pending_updates=True clears any queued updates from a previous
-    # (possibly still-running) instance, preventing the "Conflict: terminated
-    # by other getUpdates request" error on restart.
-    # Omitting close_loop (defaults to True) ensures the event loop is fully
-    # closed on SIGTERM, so the old polling session is gone before the new
-    # instance starts.
+    
+    # ✅ Drop pending updates - Biriken eski istekleri temizle
     app.run_polling(
         drop_pending_updates=True,
-        stop_signals=(signal.SIGTERM, signal.SIGINT),
+        allowed_updates=Update.ALL_TYPES
     )
-
-
-if __name__ == "__main__":
-    main()
