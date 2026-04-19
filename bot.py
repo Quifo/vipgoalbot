@@ -1,16 +1,9 @@
-import os, asyncio, httpx, json, time, logging
+import os, asyncio, httpx, json, time
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 from brain import BettingBrain
 from dotenv import load_dotenv
-
-# ====================== LOGGING AYARLARI ======================
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -99,13 +92,13 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
                     await asyncio.sleep(6 * (attempt + 1))
                     continue
                 else:
-                    print(f"️ Groq API Hatası: {r.status_code}")
+                    print(f"⚠️ Groq API Hatası: {r.status_code}")
                     await asyncio.sleep(4)
         except Exception as e:
-            print(f"️ Groq Hatası: {e}")
+            print(f"⚠️ Groq Hatası: {e}")
             await asyncio.sleep(5)
 
-    print("️ Groq AI başarısız oldu, varsayılan yanıt.")
+    print("⚠️ Groq AI başarısız oldu, varsayılan yanıt.")
     return f"{home} takımının hücum istatistikleri ve baskısı gol olasılığını artırıyor."
 
 
@@ -145,7 +138,6 @@ async def manage_history(mode="read", data=None):
         except:
             return [] if mode == "read" else None
 
-# ✅ DÜZELTİLDİ: Float değerler artık hatasız okunuyor
 async def get_stats(match_id):
     url = STATS_URL.format(match_id)
     data = await fetch_api(url)
@@ -157,9 +149,8 @@ async def get_stats(match_id):
                 for g in p.get('groups', []):
                     for i in g.get('statisticsItems', []):
                         n = i['name']
-                        # ✅ HATA DÜZELTİLDİ: Önce float, sonra int çevirimi
-                        hv = int(float(str(i.get('homeValue', 0)).replace('%','').replace('-','0')))
-                        av = int(float(str(i.get('awayValue', 0)).replace('%','').replace('-','0')))
+                        hv = int(str(i.get('homeValue', 0)).replace('%',''))
+                        av = int(str(i.get('awayValue', 0)).replace('%',''))
                         if n == 'Shots on target': s['home_sot'], s['away_sot'], s['has'] = hv, av, True
                         elif n == 'Total shots': s['home_shots'], s['away_shots'], s['has'] = hv, av, True
                         elif n == 'Corner kicks': s['home_corners'], s['away_corners'] = hv, av
@@ -208,13 +199,13 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ai_status = "✅ OK" if len(ai_test) > 10 else "❌ HATA"
     
     report = (
-        f" *BOT DENETİM RAPORU*\n\n"
+        f"🛡 *BOT DENETİM RAPORU*\n\n"
         f"🌐 API: {'✅ OK' if api_data else '❌ HATA'}\n"
         f"💾 Gist: {'✅ OK' if isinstance(gist_data, list) else '❌ HATA'}\n"
         f"🧠 AI: {ai_status}\n"
         f"📩 İletim: {delivery}\n"
-        f" Canlı Maç: {len(api_data.get('events', []))}\n"
-        f" Hafızadaki Sinyal: {len(gist_data) if isinstance(gist_data, list) else 0}\n\n"
+        f"⚽ Canlı Maç: {len(api_data.get('events', []))}\n"
+        f"📊 Hafızadaki Sinyal: {len(gist_data) if isinstance(gist_data, list) else 0}\n\n"
         f"🚀 _Sistem aktif!_"
     )
     await msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
@@ -279,7 +270,7 @@ async def signal_monitor(app):
                             alt_picks = [p for p in res.get('alt', []) if p[0] != res['pick']]
                             alt_txt = "".join([f"  • {p[0]} (Risk: {p[2]})\n" for p in alt_picks[:3]])
                             
-                            bar = "" * (res['pressure'] // 10) + "⬜" * (10 - res['pressure'] // 10)
+                            bar = "🟩" * (res['pressure'] // 10) + "⬜" * (10 - res['pressure'] // 10)
                             alt_section = f"\n💡 *ALTERNATİF ÖNERİLER*\n{alt_txt}" if alt_txt else ""
                             
                             txt = (
@@ -297,15 +288,15 @@ async def signal_monitor(app):
                                 f"{bar} `%{res['pressure']}`\n"
                                 f"🚀 *Baskı Yapan:* {res['team']}\n\n"
                                 f"📈 *İSTATİSTİKLER*\n"
-                                f"   Şut: `{stats['home_sot']}-{stats['away_sot']}`\n"
+                                f"  🥅 Şut: `{stats['home_sot']}-{stats['away_sot']}`\n"
                                 f"  ⚡ T.Şut: `{stats['home_shots']}-{stats['away_shots']}`\n"
-                                f"   Korner: `{stats['home_corners']}-{stats['away_corners']}`\n"
+                                f"  🚩 Korner: `{stats['home_corners']}-{stats['away_corners']}`\n"
                                 f"  🎮 Hakimiyet: `%{stats['home_poss']}-%{stats['away_poss']}`\n"
                                 f"{alt_section}\n"
                                 f"🧠 *AI TRADER YORUMU:*\n"
                                 f"_{ai_msg}_\n\n"
                                 f"💎 _ROI Odaklı Profesyonel Algoritma_\n"
-                                f" {time.strftime('%H:%M')}"
+                                f"⏰ {time.strftime('%H:%M')}"
                             )
                             
                             try:
