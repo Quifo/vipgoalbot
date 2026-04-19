@@ -91,40 +91,44 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
 
 # ====================== GERÇEK ORAN (DÜZELTİLDİ) ======================
 async def get_live_odds(match_id, pick):
-    """Genişletilmiş ve daha güçlü oran çekme"""
-    try:
-        # 1. Deneme: Over/Under
-        url = f"https://www.sofascore.com/api/v1/event/{match_id}/odds/2/all"
-        data = await fetch_api(url)
-        
-        if data and 'odds' in data:
-            pick_lower = pick.lower()
+    """Çoklu endpoint ile agresif oran arama"""
+    pick_lower = pick.lower()
+    default_odds = 1.55
+
+    # Denenecek endpoint'ler
+    endpoints = [
+        f"https://www.sofascore.com/api/v1/event/{match_id}/odds/2/all",  # Over/Under
+        f"https://www.sofascore.com/api/v1/event/{match_id}/odds/1/all",  # 1X2
+        f"https://www.sofascore.com/api/v1/event/{match_id}/odds/3/all"   # Diğer marketler
+    ]
+
+    for url in endpoints:
+        try:
+            data = await fetch_api(url)
+            if not data or 'odds' not in data:
+                continue
+
             for bookmaker in data.get('odds', []):
                 for market in bookmaker.get('markets', []):
                     for outcome in market.get('outcomes', []):
                         name = outcome.get('name', '').lower()
-                        price = float(outcome.get('price', 1.55))
-                        
-                        if ('üst' in pick_lower or 'over' in pick_lower) and any(x in name for x in ['over', 'üstü', '1.5', '2.5', '3.5']):
-                            logger.info(f"✅ Oran bulundu (Over): {pick} = {price}")
-                            return round(price, 2)
-                        
-                        if ('kg' in pick_lower or 'both' in pick_lower) and any(x in name for x in ['both', 'her iki', 'kg var', 'yes']):
-                            logger.info(f"✅ Oran bulundu (KG): {pick} = {price}")
+                        price = float(outcome.get('price', default_odds))
+
+                        # ÜST bahisleri
+                        if ('üst' in pick_lower or 'over' in pick_lower) and any(x in name for x in ['over', 'üstü', '1.5', '2.5', '3.5', '0.5']):
+                            logger.info(f"✅ Oran bulundu: {pick} = {price} | Match ID: {match_id}")
                             return round(price, 2)
 
-        # 2. Deneme: 1X2 Market (Yedek)
-        url = f"https://www.sofascore.com/api/v1/event/{match_id}/odds/1/all"
-        data = await fetch_api(url)
-        if data and 'odds' in data:
-            logger.info(f"1X2 market denendi → Match ID: {match_id}")
+                        # KG VAR bahisleri
+                        if ('kg' in pick_lower or 'both' in pick_lower) and any(x in name for x in ['both', 'her iki', 'kg var', 'yes', 'evet']):
+                            logger.info(f"✅ Oran bulundu: {pick} = {price} | Match ID: {match_id}")
+                            return round(price, 2)
 
-        logger.warning(f"Oran bulunamadı, varsayılan değer döndü → Match ID: {match_id} | Pick: {pick}")
-        return 1.55
+        except Exception as e:
+            continue
 
-    except Exception as e:
-        logger.error(f"Oran çekme hatası: {e}")
-        return 1.55
+    logger.warning(f"Oran bulunamadı → Match ID: {match_id} | Pick: {pick}")
+    return default_odds
 
 
 # ====================== YARDIMCI FONKSİYONLAR ======================
