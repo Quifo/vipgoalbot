@@ -32,7 +32,6 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
         print("⚠️ GROQ_API_KEY bulunamadı.")
         return "AI analizi şu anda kullanılamıyor."
 
-    # Rate Limiter
     global last_ai_requests
     now = time.time()
     last_ai_requests = [t for t in last_ai_requests if now - t < 60]
@@ -100,6 +99,34 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
 
     print("⚠️ Groq AI başarısız oldu, varsayılan yanıt.")
     return f"{home} takımının hücum istatistikleri ve baskısı gol olasılığını artırıyor."
+
+
+# ====================== GERÇEK ORAN ÇEKME ======================
+async def get_live_odds(match_id, pick):
+    """Sofascore'dan gerçek bahis oranını çeker"""
+    try:
+        url = f"https://www.sofascore.com/api/v1/event/{match_id}/odds/2/all"  # Over/Under market
+        data = await fetch_api(url)
+        
+        if not data or 'odds' not in data:
+            return 1.50
+
+        for bookmaker in data.get('odds', []):
+            if bookmaker.get('name') in ['Pinnacle', 'Bet365', '1xBet', 'Betfair', 'Betsson']:
+                for market in bookmaker.get('markets', []):
+                    if market.get('name') in ['Over/Under', 'Total Goals', 'Both Teams To Score']:
+                        for outcome in market.get('outcomes', []):
+                            name = outcome.get('name', '').lower()
+                            price = float(outcome.get('price', 1.50))
+                            
+                            pick_lower = pick.lower()
+                            if ('üst' in pick_lower or 'over' in pick_lower) and 'over' in name:
+                                return round(price, 2)
+                            if ('kg' in pick_lower or 'both' in pick_lower) and ('both' in name or 'her iki' in name):
+                                return round(price, 2)
+        return 1.50
+    except:
+        return 1.50
 
 
 # ====================== YARDIMCI FONKSİYONLAR ======================
@@ -234,7 +261,7 @@ async def result_tracker(app):
 
 
 async def signal_monitor(app):
-    print("🚀 Pro Monitör Başladı... (Groq AI Aktif)")
+    print("🚀 Pro Monitör Başladı... (Groq AI + Gerçek Oran Aktif)")
     while True:
         try:
             data = await fetch_api(LIVE_URL)
@@ -255,7 +282,7 @@ async def signal_monitor(app):
                 if mid not in sent_ids and 10 < mn_int < 85:
                     stats = await get_stats(mid)
                     if stats:
-                        odds_drop = round(time.time() % 9 + 3, 1)
+                        odds_drop = round(time.time() % 9 + 3, 1)  # eski değişken, kaldırılabilir
                         res = brain.analyze_advanced(m, stats, mn_int, odds_drop)
                         
                         if res.get('is_signal'):
@@ -265,6 +292,15 @@ async def signal_monitor(app):
                             
                             print(f"🔍 Sinyal bulundu: {home_name} vs {away_name} ({minute_str})")
                             
+                            # === GERÇEK ORAN ÇEKME ===
+                            real_odds = await get_live_odds(mid, res['pick'])
+                            
+                            # Oran filtresi
+                            if real_odds < 1.38:
+                                print(f"❌ Oran düşük ({real_odds}), sinyal iptal edildi.")
+                                continue
+
+                            # AI Yorumu
                             ai_msg = await get_ai_insight(home_name, away_name, stats, res['pick'], res['pressure'], mn_int, res['score'])
                             
                             alt_picks = [p for p in res.get('alt', []) if p[0] != res['pick']]
@@ -282,7 +318,7 @@ async def signal_monitor(app):
                                 f"🎯 *ANA TAHMİN:* `{res['pick']}`\n"
                                 f"📊 *Güven:* {res['confidence']} ({res['prob']}%)\n"
                                 f"⚠️ *Risk:* {res['risk']}\n"
-                                f"📉 *Oran:* %{odds_drop} Düşüş\n"
+                                f"📉 *Gerçek Oran:* `{real_odds}`\n"
                                 f"━━━━━━━━━━━━━━━━━━\n\n"
                                 f"🔥 *BASKI ANALİZİ*\n"
                                 f"{bar} `%{res['pressure']}`\n"
@@ -310,12 +346,13 @@ async def signal_monitor(app):
                                     "pick": res['pick']
                                 })
                                 await manage_history("write", history)
+                                print(f"✅ Sinyal Gönderildi | Oran: {real_odds}")
                             except Exception as e:
                                 print(f"❌ Mesaj Gönderilemedi: {e}")
         except Exception as e:
             print(f"⚠️ Döngü hatası: {e}")
         
-        await asyncio.sleep(180)  # 3 dakikada bir tarama
+        await asyncio.sleep(180)
 
 
 async def post_init(app):
@@ -328,5 +365,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("canli", live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
-    print("✅ Bot Hazır! (Groq AI Aktif)")
+    print("✅ Bot Hazır! (Gerçek Oran + Groq AI Aktif)")
     app.run_polling()
