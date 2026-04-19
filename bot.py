@@ -1,9 +1,16 @@
-import os, asyncio, httpx, json, time
+import os, asyncio, httpx, json, time, logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 from brain import BettingBrain
 from dotenv import load_dotenv
+
+# ====================== LOGGING AYARLARI ======================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -15,6 +22,9 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 
 brain = BettingBrain()
+
+# GitHub Gist için Lock (Aynı anda yazmayı engeller)
+gist_lock = asyncio.Lock()
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 GIST_HEADERS = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
@@ -29,16 +39,15 @@ MAX_AI_REQUESTS_PER_MINUTE = 20
 # ====================== GROQ AI ANALİZ ======================
 async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
     if not GROQ_KEY:
-        print("⚠️ GROQ_API_KEY bulunamadı.")
+        logger.warning("⚠️ GROQ_API_KEY bulunamadı.")
         return "AI analizi şu anda kullanılamıyor."
 
-    # Rate Limiter
     global last_ai_requests
     now = time.time()
     last_ai_requests = [t for t in last_ai_requests if now - t < 60]
     
     if len(last_ai_requests) >= MAX_AI_REQUESTS_PER_MINUTE:
-        print("⚠️ AI rate limit aşıldı.")
+        logger.warning("⚠️ AI rate limit aşıldı.")
         return f"{home} takımının isabetli şut ve baskı üstünlüğü gol beklentisini artırıyor."
 
     last_ai_requests.append(now)
@@ -84,40 +93,45 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
                     data = r.json()
                     comment = data['choices'][0]['message']['content']
                     clean = comment.replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '').strip()
-                    print(f"🧠 Groq AI → {clean[:70]}...")
+                    logger.info(f"🧠 Groq AI → {clean[:70]}...")
                     return clean
 
                 elif r.status_code == 429:
-                    print(f"⚠️ Groq rate limit, bekleniyor...")
+                    logger.warning(f"⚠️ Groq rate limit, bekleniyor...")
                     await asyncio.sleep(6 * (attempt + 1))
                     continue
                 else:
-                    print(f"⚠️ Groq API Hatası: {r.status_code}")
+                    logger.warning(f"⚠️ Groq API Hatası: {r.status_code}")
                     await asyncio.sleep(4)
         except Exception as e:
-            print(f"⚠️ Groq Hatası: {e}")
+            logger.error(f"⚠️ Groq Hatası: {e}")
             await asyncio.sleep(5)
 
-    print("⚠️ Groq AI başarısız oldu, varsayılan yanıt.")
+    logger.warning("⚠️ Groq AI başarısız oldu, varsayılan yanıt.")
     return f"{home} takımının hücum istatistikleri ve baskısı gol olasılığını artırıyor."
 
 
 # ====================== YARDIMCI FONKSİYONLAR ======================
 async def fetch_api(url):
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=HEADERS) as client:
         try:
-            r = await client.get(url, headers=HEADERS)
+            r = await client.get(url)
             return r.json() if r.status_code == 200 else {}
-        except:
+        except Exception as e:
+            logger.error(f"API Hatası ({url}): {e}")
             return {}
 
 def get_real_minute(m):
     status = m.get('status', {})
     desc = status.get('description', '').lower()
     elapsed = status.get('elapsed', 0)
-    if 'ht' in desc: return "İY"
-    if 'ft' in desc: return "MS"
-    if "2nd half" in desc and elapsed < 45: elapsed += 45
+    
+    if 'ht' in desc: 
+        return "İY"
+    if 'ft' in desc: 
+        return "MS"
+    if "2nd half" in desc and elapsed < 45: 
+        elapsed += 45
     if elapsed <= 1:
         start_ts = m.get('startTimestamp')
         if start_ts:
@@ -126,17 +140,29 @@ def get_real_minute(m):
     return f"{elapsed or 1}'"
 
 async def manage_history(mode="read", data=None):
+    """GitHub Gist yönetimi - Lock ile güvenli"""
     url = f"https://api.github.com/gists/{GIST_ID}"
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        try:
-            if mode == "read":
-                r = await client.get(url, headers=GIST_HEADERS)
-                return json.loads(r.json()['files']['sent_signals.json']['content'])
-            else:
-                payload = {"files": {"sent_signals.json": {"content": json.dumps(data)}}}
-                await client.patch(url, headers=GIST_HEADERS, json=payload)
-        except:
-            return [] if mode == "read" else None
+    
+    async with gist_lock:  # Aynı anda sadece bir işlem
+        async with httpx.AsyncClient(timeout=20.0, headers=GIST_HEADERS) as client:
+            try:
+                if mode == "read":
+                    r = await client.get(url)
+                    if r.status_code == 200:
+                        content = r.json()['files']['sent_signals.json']['content']
+                        return json.loads(content)
+                    else:
+                        logger.error(f"Gist Read Hatası: {r.status_code}")
+                        return []
+                else:
+                    payload = {"files": {"sent_signals.json": {"content": json.dumps(data)}}}
+                    r = await client.patch(url, json=payload)
+                    if r.status_code != 200:
+                        logger.error(f"Gist Write Hatası: {r.status_code}")
+                    return None
+            except Exception as e:
+                logger.error(f"Gist İşlem Hatası: {e}")
+                return [] if mode == "read" else None
 
 async def get_stats(match_id):
     url = STATS_URL.format(match_id)
@@ -149,14 +175,19 @@ async def get_stats(match_id):
                 for g in p.get('groups', []):
                     for i in g.get('statisticsItems', []):
                         n = i['name']
-                        hv = int(str(i.get('homeValue', 0)).replace('%',''))
-                        av = int(str(i.get('awayValue', 0)).replace('%',''))
-                        if n == 'Shots on target': s['home_sot'], s['away_sot'], s['has'] = hv, av, True
-                        elif n == 'Total shots': s['home_shots'], s['away_shots'], s['has'] = hv, av, True
-                        elif n == 'Corner kicks': s['home_corners'], s['away_corners'] = hv, av
-                        elif n == 'Ball possession': s['home_poss'], s['away_poss'] = hv, av
+                        hv = int(str(i.get('homeValue', 0)).replace('%','').replace('-','0'))
+                        av = int(str(i.get('awayValue', 0)).replace('%','').replace('-','0'))
+                        if n == 'Shots on target': 
+                            s['home_sot'], s['away_sot'], s['has'] = hv, av, True
+                        elif n == 'Total shots': 
+                            s['home_shots'], s['away_shots'], s['has'] = hv, av, True
+                        elif n == 'Corner kicks': 
+                            s['home_corners'], s['away_corners'] = hv, av
+                        elif n == 'Ball possession': 
+                            s['home_poss'], s['away_poss'] = hv, av
         return s if s['has'] else None
-    except:
+    except Exception as e:
+        logger.error(f"Stats Parse Hatası: {e}")
         return None
 
 
@@ -193,8 +224,9 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     delivery = "✅ OK"
     try: 
         await context.bot.send_message(chat_id=CHAT_ID, text="🧪 Sistem Testi")
-    except: 
+    except Exception as e:
         delivery = "❌ HATA"
+        logger.error(f"Test Mesaj Hatası: {e}")
     
     ai_status = "✅ OK" if len(ai_test) > 10 else "❌ HATA"
     
@@ -213,9 +245,13 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ====================== DÖNGÜLER ======================
 async def result_tracker(app):
+    """Maç sonuçlarını takip eder ve Gist'i günceller"""
     while True:
         try:
             history = await manage_history("read")
+            if not isinstance(history, list):
+                history = []
+            
             updated = False
             for sig in history[-20:]:
                 if sig.get('status') == 'pending' and (time.time() - sig['timestamp']) > 3600:
@@ -226,35 +262,47 @@ async def result_tracker(app):
                         sig['status'] = 'WIN ✅' if is_win else 'LOSS ❌'
                         sig['final_score'] = f"{ev['homeScore']['current']}-{ev['awayScore']['current']}"
                         updated = True
+            
             if updated: 
                 await manage_history("write", history)
-        except:
-            pass
-        await asyncio.sleep(600)
+                logger.info("📊 Sonuçlar güncellendi.")
+        except Exception as e:
+            logger.error(f"Result Tracker Hatası: {e}")
+        
+        await asyncio.sleep(600)  # 10 dakikada bir kontrol
 
 
 async def signal_monitor(app):
-    print("🚀 Pro Monitör Başladı... (Groq AI Aktif)")
+    """Canlı maçları tarar ve sinyal üretir"""
+    logger.info("🚀 Pro Monitör Başladı... (Groq AI Aktif)")
+    
     while True:
         try:
             data = await fetch_api(LIVE_URL)
             events = data.get('events', [])
             history = await manage_history("read")
+            
+            if not isinstance(history, list):
+                history = []
+                
             sent_ids = [str(x['id']) for x in history]
 
-            print(f"📊 {len(events)} maç taranıyor | Hafızada {len(history)} sinyal")
+            logger.info(f"📊 {len(events)} maç taranıyor | Hafızada {len(history)} sinyal")
 
             for m in events:
                 mid = str(m['id'])
                 minute_str = get_real_minute(m)
+                
                 try: 
                     mn_int = int(minute_str.replace("'", "")) if "'" in minute_str else 45
                 except: 
                     mn_int = 0
 
+                # Sinyal gönderilmemiş ve uygun dakika aralığında
                 if mid not in sent_ids and 10 < mn_int < 85:
                     stats = await get_stats(mid)
-                    if stats:
+                    
+                    if stats and stats.get('has'):
                         odds_drop = round(time.time() % 9 + 3, 1)
                         res = brain.analyze_advanced(m, stats, mn_int, odds_drop)
                         
@@ -263,7 +311,7 @@ async def signal_monitor(app):
                             away_name = m['awayTeam']['name']
                             league = m.get('tournament', {}).get('name', 'Bilinmiyor')
                             
-                            print(f"🔍 Sinyal bulundu: {home_name} vs {away_name} ({minute_str})")
+                            logger.info(f"🔍 Sinyal bulundu: {home_name} vs {away_name} ({minute_str})")
                             
                             ai_msg = await get_ai_insight(home_name, away_name, stats, res['pick'], res['pressure'], mn_int, res['score'])
                             
@@ -310,17 +358,23 @@ async def signal_monitor(app):
                                     "pick": res['pick']
                                 })
                                 await manage_history("write", history)
+                                logger.info(f"✅ Sinyal gönderildi: {res['pick']}")
                             except Exception as e:
-                                print(f"❌ Mesaj Gönderilemedi: {e}")
+                                logger.error(f"❌ Mesaj Gönderilemedi: {e}")
         except Exception as e:
-            print(f"⚠️ Döngü hatası: {e}")
+            logger.error(f"⚠️ Döngü hatası: {e}")
         
         await asyncio.sleep(180)  # 3 dakikada bir tarama
 
 
 async def post_init(app):
-    asyncio.create_task(signal_monitor(app))
-    asyncio.create_task(result_tracker(app))
+    """Bot başlatıldığında arka plan görevlerini başlat"""
+    try:
+        asyncio.create_task(result_tracker(app))
+        asyncio.create_task(signal_monitor(app))
+        logger.info("✅ Arka plan görevleri başlatıldı.")
+    except Exception as e:
+        logger.error(f"Post Init Hatası: {e}")
 
 
 if __name__ == "__main__":
@@ -328,5 +382,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("canli", live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
-    print("✅ Bot Hazır! (Groq AI Aktif)")
+    logger.info("✅ Bot Hazır! (Groq AI Aktif)")
     app.run_polling()
