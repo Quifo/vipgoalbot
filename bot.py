@@ -201,7 +201,7 @@ async def get_stats(match_id):
     data = await fetch_api(url)
     
     if not data or 'statistics' not in data:
-        logger.debug(f"İstatistik verisi yok (404) → Match ID: {match_id}")
+        logger.debug(f"İstatistik verisi yok → Match ID: {match_id}")
         return None
 
     s = {'home_sot':0, 'away_sot':0, 'home_shots':0, 'away_shots':0, 
@@ -213,8 +213,12 @@ async def get_stats(match_id):
                 for g in p.get('groups', []):
                     for i in g.get('statisticsItems', []):
                         n = i['name']
-                        hv = int(str(i.get('homeValue', 0)).replace('%',''))
-                        av = int(str(i.get('awayValue', 0)).replace('%',''))
+                        # Ondalıklı değerleri de kabul et
+                        home_str = str(i.get('homeValue', 0)).replace('%', '').strip()
+                        away_str = str(i.get('awayValue', 0)).replace('%', '').strip()
+                        
+                        hv = int(float(home_str)) if home_str.replace('.', '').isdigit() else 0
+                        av = int(float(away_str)) if away_str.replace('.', '').isdigit() else 0
                         
                         if n == 'Shots on target':
                             s['home_sot'], s['away_sot'], s['has'] = hv, av, True
