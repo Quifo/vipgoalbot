@@ -199,8 +199,14 @@ async def manage_history(mode="read", data=None):
 async def get_stats(match_id):
     url = STATS_URL.format(match_id)
     data = await fetch_api(url)
+    
+    if not data or 'statistics' not in data:
+        logger.debug(f"İstatistik verisi yok (404) → Match ID: {match_id}")
+        return None
+
     s = {'home_sot':0, 'away_sot':0, 'home_shots':0, 'away_shots':0, 
          'home_corners':0, 'away_corners':0, 'home_poss':50, 'away_poss':50, 'has':False}
+    
     try:
         for p in data.get('statistics', []):
             if p.get('period') == 'ALL':
@@ -209,12 +215,18 @@ async def get_stats(match_id):
                         n = i['name']
                         hv = int(str(i.get('homeValue', 0)).replace('%',''))
                         av = int(str(i.get('awayValue', 0)).replace('%',''))
-                        if n == 'Shots on target': s['home_sot'], s['away_sot'], s['has'] = hv, av, True
-                        elif n == 'Total shots': s['home_shots'], s['away_shots'], s['has'] = hv, av, True
-                        elif n == 'Corner kicks': s['home_corners'], s['away_corners'] = hv, av
-                        elif n == 'Ball possession': s['home_poss'], s['away_poss'] = hv, av
+                        
+                        if n == 'Shots on target':
+                            s['home_sot'], s['away_sot'], s['has'] = hv, av, True
+                        elif n == 'Total shots':
+                            s['home_shots'], s['away_shots'], s['has'] = hv, av, True
+                        elif n == 'Corner kicks':
+                            s['home_corners'], s['away_corners'] = hv, av
+                        elif n == 'Ball possession':
+                            s['home_poss'], s['away_poss'] = hv, av
         return s if s['has'] else None
-    except:
+    except Exception as e:
+        logger.error(f"İstatistik işleme hatası: {e}")
         return None
 
 
