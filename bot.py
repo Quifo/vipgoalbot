@@ -364,11 +364,11 @@ def main():
     # drop_pending_updates=True clears any queued updates from a previous
     # (possibly still-running) instance, preventing the "Conflict: terminated
     # by other getUpdates request" error on restart.
-    # close_loop=False lets us manage the event loop ourselves so that the
-    # SIGTERM handler below can trigger a clean shutdown.
+    # Omitting close_loop (defaults to True) ensures the event loop is fully
+    # closed on SIGTERM, so the old polling session is gone before the new
+    # instance starts.
     app.run_polling(
         drop_pending_updates=True,
-        close_loop=False,
         stop_signals=(signal.SIGTERM, signal.SIGINT),
     )
 
