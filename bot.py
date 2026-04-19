@@ -1,4 +1,4 @@
-import os, asyncio, httpx, json, time
+import os, asyncio, httpx, json, time, signal, sys
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -26,6 +26,9 @@ STATS_URL = "https://www.sofascore.com/api/v1/event/{}/statistics"
 last_ai_requests = []
 MAX_AI_REQUESTS_PER_MINUTE = 20
 
+# Background task handles for clean cancellation on shutdown
+_background_tasks: list[asyncio.Task] = []
+
 # ====================== GROQ AI ANALİZ ======================
 async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
     if not GROQ_KEY:
@@ -36,7 +39,7 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
     global last_ai_requests
     now = time.time()
     last_ai_requests = [t for t in last_ai_requests if now - t < 60]
-    
+
     if len(last_ai_requests) >= MAX_AI_REQUESTS_PER_MINUTE:
         print("⚠️ AI rate limit aşıldı.")
         return f"{home} takımının isabetli şut ve baskı üstünlüğü gol beklentisini artırıyor."
@@ -79,7 +82,7 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 r = await client.post(url, json=payload, headers=headers)
-                
+
                 if r.status_code == 200:
                     data = r.json()
                     comment = data['choices'][0]['message']['content']
@@ -141,7 +144,7 @@ async def manage_history(mode="read", data=None):
 async def get_stats(match_id):
     url = STATS_URL.format(match_id)
     data = await fetch_api(url)
-    s = {'home_sot':0, 'away_sot':0, 'home_shots':0, 'away_shots':0, 
+    s = {'home_sot':0, 'away_sot':0, 'home_shots':0, 'away_shots':0,
          'home_corners':0, 'away_corners':0, 'home_poss':50, 'away_poss':50, 'has':False}
     try:
         for p in data.get('statistics', []):
@@ -189,15 +192,15 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api_data = await fetch_api(LIVE_URL)
     gist_data = await manage_history("read")
     ai_test = await get_ai_insight("TestA", "TestB", {'home_sot':3,'away_sot':1,'home_shots':8,'away_shots':3,'home_corners':4,'away_corners':1,'home_poss':60,'away_poss':40}, "1.5 ÜST", 70, 55, "1-0")
-    
+
     delivery = "✅ OK"
-    try: 
+    try:
         await context.bot.send_message(chat_id=CHAT_ID, text="🧪 Sistem Testi")
-    except: 
+    except:
         delivery = "❌ HATA"
-    
+
     ai_status = "✅ OK" if len(ai_test) > 10 else "❌ HATA"
-    
+
     report = (
         f"🛡 *BOT DENETİM RAPORU*\n\n"
         f"🌐 API: {'✅ OK' if api_data else '❌ HATA'}\n"
@@ -226,7 +229,7 @@ async def result_tracker(app):
                         sig['status'] = 'WIN ✅' if is_win else 'LOSS ❌'
                         sig['final_score'] = f"{ev['homeScore']['current']}-{ev['awayScore']['current']}"
                         updated = True
-            if updated: 
+            if updated:
                 await manage_history("write", history)
         except:
             pass
@@ -247,9 +250,9 @@ async def signal_monitor(app):
             for m in events:
                 mid = str(m['id'])
                 minute_str = get_real_minute(m)
-                try: 
+                try:
                     mn_int = int(minute_str.replace("'", "")) if "'" in minute_str else 45
-                except: 
+                except:
                     mn_int = 0
 
                 if mid not in sent_ids and 10 < mn_int < 85:
@@ -257,22 +260,22 @@ async def signal_monitor(app):
                     if stats:
                         odds_drop = round(time.time() % 9 + 3, 1)
                         res = brain.analyze_advanced(m, stats, mn_int, odds_drop)
-                        
+
                         if res.get('is_signal'):
                             home_name = m['homeTeam']['name']
                             away_name = m['awayTeam']['name']
                             league = m.get('tournament', {}).get('name', 'Bilinmiyor')
-                            
+
                             print(f"🔍 Sinyal bulundu: {home_name} vs {away_name} ({minute_str})")
-                            
+
                             ai_msg = await get_ai_insight(home_name, away_name, stats, res['pick'], res['pressure'], mn_int, res['score'])
-                            
+
                             alt_picks = [p for p in res.get('alt', []) if p[0] != res['pick']]
                             alt_txt = "".join([f"  • {p[0]} (Risk: {p[2]})\n" for p in alt_picks[:3]])
-                            
+
                             bar = "🟩" * (res['pressure'] // 10) + "⬜" * (10 - res['pressure'] // 10)
                             alt_section = f"\n💡 *ALTERNATİF ÖNERİLER*\n{alt_txt}" if alt_txt else ""
-                            
+
                             txt = (
                                 f"🚨 *VIP PRO TRADER ANALİZİ* 🚨\n\n"
                                 f"⚽ *{home_name}* `{res['score']}` *{away_name}*\n"
@@ -298,7 +301,7 @@ async def signal_monitor(app):
                                 f"💎 _ROI Odaklı Profesyonel Algoritma_\n"
                                 f"⏰ {time.strftime('%H:%M')}"
                             )
-                            
+
                             try:
                                 await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
                                 history.append({
@@ -314,19 +317,61 @@ async def signal_monitor(app):
                                 print(f"❌ Mesaj Gönderilemedi: {e}")
         except Exception as e:
             print(f"⚠️ Döngü hatası: {e}")
-        
+
         await asyncio.sleep(180)  # 3 dakikada bir tarama
 
 
+# ====================== LIFECYCLE ======================
 async def post_init(app):
-    asyncio.create_task(signal_monitor(app))
-    asyncio.create_task(result_tracker(app))
+    """Start background tasks after the application is fully initialised."""
+    t1 = asyncio.create_task(signal_monitor(app), name="signal_monitor")
+    t2 = asyncio.create_task(result_tracker(app), name="result_tracker")
+    _background_tasks.extend([t1, t2])
 
 
-if __name__ == "__main__":
-    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+async def post_shutdown(app):
+    """Cancel background tasks before the application shuts down."""
+    for task in _background_tasks:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    _background_tasks.clear()
+    print("🛑 Arka plan görevleri durduruldu.")
+
+
+def main():
+    if not TOKEN:
+        print("❌ TELEGRAM_TOKEN bulunamadı. Bot durduruluyor.")
+        sys.exit(1)
+
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("canli", live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
+
     print("✅ Bot Hazır! (Groq AI Aktif)")
-    app.run_polling()
+
+    # drop_pending_updates=True clears any queued updates from a previous
+    # (possibly still-running) instance, preventing the "Conflict: terminated
+    # by other getUpdates request" error on restart.
+    # close_loop=False lets us manage the event loop ourselves so that the
+    # SIGTERM handler below can trigger a clean shutdown.
+    app.run_polling(
+        drop_pending_updates=True,
+        close_loop=False,
+        stop_signals=(signal.SIGTERM, signal.SIGINT),
+    )
+
+
+if __name__ == "__main__":
+    main()
