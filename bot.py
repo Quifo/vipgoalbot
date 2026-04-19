@@ -32,17 +32,14 @@ _background_tasks: list[asyncio.Task] = []
 # ====================== GROQ AI ANALİZ ======================
 async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
     if not GROQ_KEY:
-        print("⚠️ GROQ_API_KEY bulunamadı.")
-        return "AI analizi şu anda kullanılamıyor."
+        return "Veri yetersiz."
 
-    # Rate Limiter
     global last_ai_requests
     now = time.time()
     last_ai_requests = [t for t in last_ai_requests if now - t < 60]
-
+    
     if len(last_ai_requests) >= MAX_AI_REQUESTS_PER_MINUTE:
-        print("⚠️ AI rate limit aşıldı.")
-        return f"{home} takımının isabetli şut ve baskı üstünlüğü gol beklentisini artırıyor."
+        return _fallback_comment(home, away, stats, pick, pressure)
 
     last_ai_requests.append(now)
 
@@ -52,24 +49,78 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score):
         "Content-Type": "application/json"
     }
 
+    # ✅ YENİ PROMPT - Kısa, keskin, profesyonel
     prompt_text = (
-        f"Sen bir profesyonel bahis analistisin. Şu maçı kısaca analiz et:\n"
-        f"Maç: {home} vs {away}\n"
-        f"Dakika: {minute}'\n"
-        f"Skor: {score}\n"
-        f"İsabetli Şut: {stats.get('home_sot',0)}-{stats.get('away_sot',0)}\n"
-        f"Toplam Şut: {stats.get('home_shots',0)}-{stats.get('away_shots',0)}\n"
-        f"Korner: {stats.get('home_corners',0)}-{stats.get('away_corners',0)}\n"
-        f"Top Hakimiyeti: %{stats.get('home_poss',50)}-%{stats.get('away_poss',50)}\n"
-        f"Baskı Gücü: %{pressure}\n"
-        f"Önerilen Bahis: {pick}\n\n"
-        f"KURALLAR:\n"
-        f"- Maksimum 2 cümle yaz\n"
-        f"- Neden mantıklı olduğunu açıkla\n"
-        f"- Özel karakter kullanma (* _ `)\n"
-        f"- Banko, kesin gibi kelimeler kullanma\n"
-        f"- Sadece veri bazlı yorum yap"
+        f"Aşağıdaki canlı maç verisini analiz et ve TAM OLARAK 2 cümle yaz.\n\n"
+        f"VERİ:\n"
+        f"- Maç: {home} vs {away} | {minute}. dakika | Skor: {score}\n"
+        f"- İsabetli Şut: {stats.get('home_sot',0)}-{stats.get('away_sot',0)}\n"
+        f"- Toplam Şut: {stats.get('home_shots',0)}-{stats.get('away_shots',0)}\n"
+        f"- Korner: {stats.get('home_corners',0)}-{stats.get('away_corners',0)}\n"
+        f"- Hakimiyet: %{stats.get('home_poss',50)}-{stats.get('away_poss',50)}\n"
+        f"- Baskı Skoru: %{pressure}\n"
+        f"- Öneri: {pick}\n\n"
+        f"YAZIM KURALLARI:\n"
+        f"1. İlk cümle: Sadece istatistikleri yorumla. Rakam kullan.\n"
+        f"2. İkinci cümle: Bu verilerle neden '{pick}' mantıklı? Direkt söyle.\n"
+        f"3. Türkçe yaz. Emir kipi kullan. Net ve kısa ol.\n"
+        f"4. Yasak kelimeler: gösteriyor, bulunuyor, devam ediyor, şu an, mevcut\n"
+        f"5. Kesinlikle * _ ` gibi özel karakter kullanma.\n"
+        f"6. Toplam 30 kelimeyi geçme."
     )
+
+    payload = {
+        "model": "llama-3.1-8b-instant",
+        "messages": [{"role": "user", "content": prompt_text}],
+        "temperature": 0.4,  # ✅ Daha az yaratıcı = Daha tutarlı
+        "max_tokens": 120    # ✅ Kısa cevap zorla
+    }
+
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.post(url, json=payload, headers=headers)
+                
+                if r.status_code == 200:
+                    data = r.json()
+                    comment = data['choices'][0]['message']['content']
+                    # Temizle
+                    clean = (comment
+                        .replace('*', '').replace('_', '').replace('`', '')
+                        .replace('[', '').replace(']', '')
+                        .replace('"', '').replace("'", '')
+                        .strip())
+                    print(f"🧠 AI → {clean[:80]}...")
+                    return clean
+
+                elif r.status_code == 429:
+                    await asyncio.sleep(6 * (attempt + 1))
+                    continue
+                else:
+                    await asyncio.sleep(4)
+        except Exception as e:
+            print(f"⚠️ Groq Hatası: {e}")
+            await asyncio.sleep(5)
+
+    return _fallback_comment(home, away, stats, pick, pressure)
+
+
+# ✅ YENİ: Akıllı fallback yorumları
+def _fallback_comment(home, away, stats, pick, pressure):
+    sot_home = stats.get('home_sot', 0)
+    sot_away = stats.get('away_sot', 0)
+    shots_home = stats.get('home_shots', 0)
+    corners_home = stats.get('home_corners', 0)
+    
+    comments = [
+        f"{home} {sot_home} isabetli şutla kaleci zorluyor, baskı kritik eşiği aştı. {pick} için istatistikler uygun.",
+        f"{shots_home} şut deneyen {home}, rakibini {corners_home} kornerle de tehdit etti. Oran değeri taşıyor.",
+        f"Baskı skoru %{pressure} ile üst sınırda. {home} isabetli şut üstünlüğünü gole dönüştürmeli.",
+        f"{home} hücum yoğunluğu artırıyor: {sot_home} isabetli şut, {corners_home} korner. {pick} hesaplanmış risk.",
+    ]
+    
+    import random
+    return random.choice(comments)
 
     payload = {
         "model": "llama-3.1-8b-instant",
@@ -276,32 +327,33 @@ async def signal_monitor(app):
                             bar = "🟩" * (res['pressure'] // 10) + "⬜" * (10 - res['pressure'] // 10)
                             alt_section = f"\n💡 *ALTERNATİF ÖNERİLER*\n{alt_txt}" if alt_txt else ""
 
-                            txt = (
-                                f"🚨 *VIP PRO TRADER ANALİZİ* 🚨\n\n"
-                                f"⚽ *{home_name}* `{res['score']}` *{away_name}*\n"
-                                f"🏆 _{league}_\n"
-                                f"⏱ *Dakika:* `{minute_str}` ({res['period']})\n"
-                                f"━━━━━━━━━━━━━━━━━━\n"
-                                f"🎯 *ANA TAHMİN:* `{res['pick']}`\n"
-                                f"📊 *Güven:* {res['confidence']} ({res['prob']}%)\n"
-                                f"⚠️ *Risk:* {res['risk']}\n"
-                                f"📉 *Oran:* %{odds_drop} Düşüş\n"
-                                f"━━━━━━━━━━━━━━━━━━\n\n"
-                                f"🔥 *BASKI ANALİZİ*\n"
-                                f"{bar} `%{res['pressure']}`\n"
-                                f"🚀 *Baskı Yapan:* {res['team']}\n\n"
-                                f"📈 *İSTATİSTİKLER*\n"
-                                f"  🥅 Şut: `{stats['home_sot']}-{stats['away_sot']}`\n"
-                                f"  ⚡ T.Şut: `{stats['home_shots']}-{stats['away_shots']}`\n"
-                                f"  🚩 Korner: `{stats['home_corners']}-{stats['away_corners']}`\n"
-                                f"  🎮 Hakimiyet: `%{stats['home_poss']}-%{stats['away_poss']}`\n"
-                                f"{alt_section}\n"
-                                f"🧠 *AI TRADER YORUMU:*\n"
-                                f"_{ai_msg}_\n\n"
-                                f"💎 _ROI Odaklı Profesyonel Algoritma_\n"
-                                f"⏰ {time.strftime('%H:%M')}"
-                            )
+                           period_emoji = "1️⃣" if res['period'] == "1. YARI" else "2️⃣"
 
+txt = (
+    f"📡 *SİNYAL* | {time.strftime('%H:%M')}\n"
+    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+    f"⚽ *{home_name}* `{res['score']}` *{away_name}*\n"
+    f"🏆 {league}\n"
+    f"⏱ `{minute_str}` {period_emoji} {res['period']}\n"
+    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+    f"🎯 *TAHMİN:* `{res['pick']}`\n"
+    f"📊 *Güven:* {res['confidence']} `{res['prob']}%`\n"
+    f"⚠️ *Risk:* `{res['risk']}`\n"
+    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+    f"📈 *İSTATİSTİKLER*\n"
+    f"┌ 🥅 İsabetli Şut: `{stats['home_sot']} - {stats['away_sot']}`\n"
+    f"├ ⚡ Toplam Şut:  `{stats['home_shots']} - {stats['away_shots']}`\n"
+    f"├ 🚩 Korner:     `{stats['home_corners']} - {stats['away_corners']}`\n"
+    f"└ 🎮 Hakimiyet:  `%{stats['home_poss']} - %{stats['away_poss']}`\n"
+    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+    f"🔥 *BASKI:* {bar} `%{res['pressure']}`\n"
+    f"👊 *Üstün Taraf:* {res['team']}\n"
+    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+    f"🧠 *ANALİZ:* _{ai_msg}_\n"
+    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+    f"{alt_section}"
+    f"💎 _VIP Pro Trader_"
+)
                             try:
                                 await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
                                 history.append({
