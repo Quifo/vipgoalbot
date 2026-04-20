@@ -128,13 +128,74 @@ async def manage_history(mode="read", data=None):
             except Exception as e:
                 logger.error(f"Gist hatası: {e}")
                 return [] if mode == "read" else None
+# ─────────────────────────────────────────
+# YENİ: ÖN FİLTRE - Gereksiz API isteklerini engelle
+# ─────────────────────────────────────────
+def should_check_match(m, sent_ids):
+    """
+    İstatistik isteği atmadan önce maçı filtrele.
+    Bu sayede 404 istekleri ve gereksiz yük azalır.
+    """
+    try:
+        mid        = str(m.get('id', ''))
+        minute_str = get_real_minute(m)
+
+        # Zaten sinyal gönderilmiş
+        if mid in sent_ids:
+            return False, "Zaten gönderildi"
+
+        # Yarı veya maç sonu
+        if minute_str in ("İY", "MS", "0'"):
+            return False, f"Geçersiz dakika: {minute_str}"
+
+        mn_int = safe_int(minute_str.replace("'", ""), 0)
+
+        # Dakika aralığı kontrolü
+        if not (10 < mn_int < 85):
+            return False, f"Dakika aralığı dışı: {mn_int}"
+
+        # Sofascore'da istatistik olan maçları filtrele
+        # hasGlobalId veya tournament bilgisi olmayan maçları atla
+        if not m.get('tournament'):
+            return False, "Turnuva bilgisi yok"
+
+        # Çok gollü maçları erken ele (brain.py'ye gerek yok)
+        h_s = safe_int(m.get('homeScore', {}).get('current', 0))
+        a_s = safe_int(m.get('awayScore', {}).get('current', 0))
+        if h_s + a_s > 4:
+            return False, f"Çok gollü: {h_s+a_s}"
+
+        return True, mn_int
+
+    except Exception as e:
+        return False, f"Filtre hatası: {e}"                
 
 # ─────────────────────────────────────────
-# İSTATİSTİK ÇEKİMİ (float düzeltmesi)
+# YENİ: İSTATİSTİK ÇEKİMİ (404 yönetimi)
 # ─────────────────────────────────────────
 async def get_stats(match_id):
-    url  = STATS_URL.format(match_id)
-    data = await fetch_api(url)
+    url = STATS_URL.format(match_id)
+
+    async with httpx.AsyncClient(
+        timeout=15.0, follow_redirects=True, headers=HEADERS
+    ) as client:
+        try:
+            r = await client.get(url)
+
+            # 404 → İstatistik yok, sessizce geç
+            if r.status_code == 404:
+                return None
+
+            # Diğer hatalar
+            if r.status_code != 200:
+                logger.warning(f"Stats {match_id}: HTTP {r.status_code}")
+                return None
+
+            data = r.json()
+        except Exception as e:
+            logger.error(f"Stats istek hatası ({match_id}): {e}")
+            return None
+
     s = {
         'home_sot': 0, 'away_sot': 0,
         'home_shots': 0, 'away_shots': 0,
@@ -161,7 +222,7 @@ async def get_stats(match_id):
                         s['home_poss'], s['away_poss'] = hv, av
         return s if s['has'] else None
     except Exception as e:
-        logger.error(f"Stats hatası: {e}")
+        logger.error(f"Stats parse hatası ({match_id}): {e}")
         return None
 
 # ─────────────────────────────────────────
@@ -345,44 +406,53 @@ async def result_tracker(app):
 
 
 # ─────────────────────────────────────────
-# SİNYAL MONİTÖRÜ
+# YENİ: SİNYAL MONİTÖRÜ (optimize edilmiş)
 # ─────────────────────────────────────────
 async def signal_monitor(app):
     logger.info("🚀 Sinyal monitörü başladı.")
+
     while True:
         try:
             data    = await fetch_api(LIVE_URL)
             events  = data.get('events', [])
             history = await manage_history("read")
+
             if not isinstance(history, list):
                 history = []
 
             sent_ids = {str(x['id']) for x in history}
-            logger.info(f"📊 {len(events)} maç taranıyor | "
-                        f"{len(history)} sinyal kayıtlı")
 
+            # ✅ Ön filtreden geçen maçları say
+            candidates = []
             for m in events:
+                ok, result = should_check_match(m, sent_ids)
+                if ok:
+                    candidates.append((m, result))  # result = mn_int
+
+            logger.info(
+                f"📊 {len(events)} maç tarandı → "
+                f"{len(candidates)} aday | "
+                f"{len(history)} sinyal kayıtlı"
+            )
+
+            # ✅ Sadece adaylar için istatistik çek
+            for m, mn_int in candidates:
                 try:
-                    mid        = str(m.get('id', ''))
-                    minute_str = get_real_minute(m)
-
-                    if minute_str in ("İY", "MS", "0'"):
-                        continue
-
-                    mn_int = safe_int(minute_str.replace("'", ""), 0)
-
-                    if mid in sent_ids or not (10 < mn_int < 85):
-                        continue
-
+                    mid   = str(m.get('id', ''))
                     stats = await get_stats(mid)
+
                     if not stats or not stats.get('has'):
                         continue
 
                     odds_drop = round(time.time() % 9 + 3, 1)
-                    res       = brain.analyze_advanced(m, stats, mn_int, odds_drop)
+                    res       = brain.analyze_advanced(
+                        m, stats, mn_int, odds_drop
+                    )
 
                     if not res.get('is_signal'):
-                        logger.info(f"⏭ Elenedi: {res.get('reason','?')}")
+                        logger.info(
+                            f"⏭ Elenedi: {res.get('reason', '?')}"
+                        )
                         continue
 
                     home_name = m.get('homeTeam', {}).get('name', 'Bilinmiyor')
@@ -391,8 +461,10 @@ async def signal_monitor(app):
                     xg_val    = res.get('xg', 0.0)
                     momentum  = res.get('momentum', 0)
 
-                    logger.info(f"🔍 Sinyal: {home_name} vs {away_name} "
-                                f"| {minute_str} | {res['pick']}")
+                    logger.info(
+                        f"🔍 Sinyal: {home_name} vs {away_name} "
+                        f"| {mn_int}' | {res['pick']}"
+                    )
 
                     ai_msg = await get_ai_insight(
                         home_name, away_name, stats,
@@ -400,28 +472,35 @@ async def signal_monitor(app):
                         mn_int, res['score'], xg_val
                     )
 
-                    # Alternatif öneriler
-                    alt_picks = [p for p in res.get('alt', [])
-                                 if p[0] != res['pick']]
-                    alt_txt   = "".join(
+                    # Alternatifler
+                    alt_picks = [
+                        p for p in res.get('alt', [])
+                        if p[0] != res['pick']
+                    ]
+                    alt_txt = "".join(
                         [f"  • {p[0]} (Risk: {p[2]})\n"
                          for p in alt_picks[:2]]
                     )
-                    alt_section = (f"\n💡 *ALTERNATİF*\n{alt_txt}"
-                                   if alt_txt else "")
+                    alt_section = (
+                        f"\n💡 *ALTERNATİF*\n{alt_txt}" if alt_txt else ""
+                    )
 
                     # Baskı barı
                     bar_val = max(0, min(100, res['pressure']))
-                    bar = ("🟩" * (bar_val // 10) +
-                           "⬜" * (10 - bar_val // 10))
+                    filled  = bar_val // 10
+                    bar     = "🟩" * filled + "⬜" * (10 - filled)
 
                     # Doğrulayıcılar
                     confirms = res.get('confirmations', [])
                     conf_txt = " · ".join(confirms[:3])
 
-                    # Mesaj
-                    period_emoji = ("1️⃣" if res['period'] == "1. YARI"
-                                    else "2️⃣")
+                    # Dönem emojisi
+                    period_emoji = (
+                        "1️⃣" if res['period'] == "1. YARI" else "2️⃣"
+                    )
+
+                    minute_str = f"{mn_int}'"
+
                     txt = (
                         f"📡 *SİNYAL* | {time.strftime('%H:%M')}\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -456,9 +535,11 @@ async def signal_monitor(app):
                     )
 
                     await app.bot.send_message(
-                        chat_id=CHAT_ID, text=txt,
+                        chat_id=CHAT_ID,
+                        text=txt,
                         parse_mode=ParseMode.MARKDOWN
                     )
+
                     history.append({
                         "id":          mid,
                         "timestamp":   time.time(),
@@ -471,8 +552,12 @@ async def signal_monitor(app):
                     sent_ids.add(mid)
                     logger.info(f"✅ Sinyal gönderildi: {res['pick']}")
 
+                    # ✅ Sinyal sonrası kısa bekleme
+                    # (API ve Telegram rate limit için)
+                    await asyncio.sleep(2)
+
                 except Exception as e:
-                    logger.error(f"Maç işleme hatası: {e}")
+                    logger.error(f"Maç işleme hatası ({m.get('id','')}): {e}")
                     continue
 
         except Exception as e:
