@@ -275,33 +275,27 @@ async def get_ai_insight(home, away, stats, pick,
         "Content-Type":  "application/json"
     }
     prompt = (
-        f"Canlı maç analizi yap. TAM OLARAK 2 kısa cümle yaz.\n\n"
-        f"Maç: {home} vs {away} | {minute}. dk | Skor: {score}\n"
-        f"İsabetli Şut: "
-        f"{stats.get('home_sot',0)}-{stats.get('away_sot',0)}\n"
-        f"Toplam Şut: "
-        f"{stats.get('home_shots',0)}-{stats.get('away_shots',0)}\n"
-        f"Tehlikeli Atak: "
-        f"{stats.get('home_dangerous',0)}-{stats.get('away_dangerous',0)}\n"
-        f"Büyük Fırsat: "
-        f"{stats.get('home_big_chances',0)}-{stats.get('away_big_chances',0)}\n"
-        f"Korner: "
-        f"{stats.get('home_corners',0)}-{stats.get('away_corners',0)}\n"
-        f"Hakimiyet: "
-        f"%{stats.get('home_poss',50)}-%{stats.get('away_poss',50)}\n"
-        f"xG: {xg} | Baskı: %{pressure} | Öneri: {pick}\n\n"
-        f"KURALLAR:\n"
-        f"1. İlk cümle: Sadece rakamlarla istatistikleri yorumla.\n"
-        f"2. İkinci cümle: Neden '{pick}' doğru? Net söyle.\n"
-        f"3. Türkçe. Emir kipi. Maks 25 kelime.\n"
-        f"4. Yasak: gösteriyor, bulunuyor, devam ediyor, mevcut, şu an\n"
-        f"5. Yasak karakter: * _ ` [ ]"
+        "Rol: Profesyonel canlı maç analisti.\n"
+        "Çıktı: TAM 2 cümle, Türkçe, kısa ve net.\n"
+        "Kural: Sadece sayı/istatistik üzerinden konuş; abartı ve genel laf yok.\n"
+        "Kural: 1. cümle baskıyı rakamlarla özetlesin. 2. cümle seçimi (pick) gerekçelendirsin.\n"
+        "Kural: Her cümle max 18 kelime. Emoji yok. Markdown karakteri yok.\n\n"
+        f"Maç: {home} - {away}\n"
+        f"Dakika: {minute} | Skor: {score}\n"
+        f"SOT: {stats.get('home_sot',0)}-{stats.get('away_sot',0)} | "
+        f"Şut: {stats.get('home_shots',0)}-{stats.get('away_shots',0)} | "
+        f"Tehlikeli: {stats.get('home_dangerous',0)}-{stats.get('away_dangerous',0)} | "
+        f"Korner: {stats.get('home_corners',0)}-{stats.get('away_corners',0)} | "
+        f"Pozisyon: {stats.get('home_poss',50)}-{stats.get('away_poss',50)} | "
+        f"xG: {xg_line} | Baskı: {pressure}\n"
+        f"Pick: {pick}\n\n"
+        "Sadece iki cümleyi yaz:"
     )
     payload = {
         "model":       "llama-3.1-8b-instant",
         "messages":    [{"role": "user", "content": prompt}],
-        "temperature": 0.35,
-        "max_tokens":  100
+        "temperature": 0.15,
+        "max_tokens":  90
     }
 
     for attempt in range(3):
