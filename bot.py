@@ -2,7 +2,7 @@
 
 import os, asyncio, httpx, json, time, logging
 import html
-from telegram.constants import ParseMode, ChatAction
+from telegram.constants import ChatAction
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -62,6 +62,17 @@ def safe_float(val, default=0.0):
         return float(str(val).replace('%', '').strip())
     except:
         return default
+def normalize_ts(ts):
+    try:
+        if ts is None:
+            return None
+        ts = int(ts)
+        # bazen ms gelebiliyor
+        if ts > 10_000_000_000:  # ~2286 yılı saniye eşiği
+            ts //= 1000
+        return ts
+    except:
+        return None        
         
 def minute_str_to_int(minute_str: str) -> int:
     """
@@ -103,85 +114,64 @@ async def fetch_api(url):
 # DAKİKA HESAPLAMA
 # ─────────────────────────────────────────
 def get_real_minute(m):
-    """
-    En stabil yöntem:
-    - period (1/2/3/4) -> yarı bazını belirler
-    - currentPeriodStartTimestamp -> o devrenin başlangıcından dakika hesaplar
-    - elapsed varsa karşılaştırma amaçlı kullanır
-    """
     try:
-        status = (m.get("status") or {})
+        now    = int(time.time())
+        status = m.get("status") or {}
         stype  = (status.get("type") or "").lower()
         desc   = (status.get("description") or "").lower()
 
-        # kesin durumlar
         if stype in ("finished", "ended"):
             return "MS"
         if stype in ("notstarted", "scheduled"):
             return "0'"
-
-        # devre arası varyantları
-        if any(x in desc for x in ("ht", "half-time", "halftime", "interval", "break")):
+        if stype in ("halftime", "break", "pause"):
+            return "İY"
+        if any(x in desc for x in ["ht", "half-time", "halftime", "interval"]):
             return "İY"
 
-        t      = (m.get("time") or {})
-        period = safe_int(t.get("period", 0), 0)
+        time_obj = m.get("time") or {}
 
-        # period bazları (uzatma gelirse 3/4)
-        base_map = {1: 0, 2: 45, 3: 90, 4: 105}
-        base     = base_map.get(period, 0)
-
-        now = int(time.time())
-
-        cps = t.get("currentPeriodStartTimestamp") or m.get("currentPeriodStartTimestamp")
-        minute_from_cps = None
-        if cps:
-            diff = max(0, (now - int(cps)) // 60)
-            minute_from_cps = base + diff
-
-        elapsed = safe_int(status.get("elapsed", 0), 0)
-        minute_from_elapsed = None
-        if elapsed > 0:
-            # bazı maçlarda elapsed ikinci yarıda 0-45 arası olur, bazı maçlarda 46+ mutlak gelir
-            if period == 2 and elapsed <= 45:
-                minute_from_elapsed = 45 + elapsed
-            elif period == 1 and elapsed <= 45:
-                minute_from_elapsed = elapsed
+        period = safe_int(time_obj.get("period", 0), 0)
+        if period not in (1, 2):
+            # description’dan infer et
+            if any(x in desc for x in ["2nd", "second", "2. yar", "ikinci"]):
+                period = 2
+            elif any(x in desc for x in ["1st", "first", "1. yar", "birinci"]):
+                period = 1
             else:
-                minute_from_elapsed = elapsed
+                period = 0
 
-        # seçim: cps varsa genelde en doğru
-        minute = None
-        if minute_from_cps is not None:
-            minute = minute_from_cps
-            # elapsed da varsa ve çok farklıysa (API sapması), mantıklı olana yaklaş
-            if minute_from_elapsed is not None and abs(minute_from_elapsed - minute_from_cps) >= 7:
-                # period aralığına uyanı seç
-                cand = [minute_from_cps, minute_from_elapsed]
-                if period == 1:
-                    cand = [x for x in cand if 1 <= x <= 55] or cand
-                elif period == 2:
-                    cand = [x for x in cand if 46 <= x <= 105] or cand
-                minute = cand[0]
-        elif minute_from_elapsed is not None:
-            minute = minute_from_elapsed
+        start_ts = normalize_ts(m.get("startTimestamp"))
+        diff_start = ((now - start_ts) // 60) if start_ts else None
+
+        # startTimestamp’a bakarak 2. yarıyı tahmin et (LIVE verisi bazen period=0/1 kalıyor)
+        if diff_start is not None:
+            if diff_start >= 55 and period in (0, 1):
+                period = 2
+            elif diff_start < 50 and period == 2:
+                period = 1
+
+        cps = normalize_ts(
+            time_obj.get("currentPeriodStartTimestamp")
+            or m.get("currentPeriodStartTimestamp")
+        )
+
+        # Öncelik: currentPeriodStartTimestamp
+        if cps and period in (1, 2):
+            elapsed_period = max(0, (now - cps) // 60)
+            minute = (period - 1) * 45 + elapsed_period
         else:
-            # son çare: startTimestamp (en kötü fallback)
-            start_ts = m.get("startTimestamp")
-            if start_ts:
-                minute = max(1, (now - int(start_ts)) // 60)
-            else:
-                return "0'"
+            # Fallback: status.elapsed
+            elapsed = safe_int(status.get("elapsed", 0), 0)
+            if elapsed <= 0 and diff_start is not None:
+                elapsed = diff_start
+            minute = elapsed
 
-        # makul aralığa sıkıştır
+            # period=2 ise ve elapsed 0-45 arasıysa, 45 ekle
+            if period == 2 and minute <= 45 and (diff_start is None or diff_start >= 55):
+                minute += 45
+
         minute = max(1, min(130, int(minute)))
-
-        # uzatma gösterimi (istersen): 45+ / 90+
-        if period == 1 and minute > 45:
-            return f"45+{minute-45}'"
-        if period == 2 and minute > 90:
-            return f"90+{minute-90}'"
-
         return f"{minute}'"
     except:
         return "0'"
@@ -290,6 +280,9 @@ async def get_stats(match_id):
         if (not isinstance(match_resp, Exception)
                 and match_resp.status_code == 200):
             ev      = match_resp.json().get('event', {})
+            minute_str = get_real_minute(ev)
+            s["minute_str"] = minute_str
+            s["minute_int"] = safe_int(str(minute_str).replace("'", ""), 0)        
             home_xg = ev.get('homeXg')
             away_xg = ev.get('awayXg')
             if home_xg is not None:
@@ -425,54 +418,65 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action=ChatAction.TYPING
-        )
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
 
-        data   = await fetch_api(LIVE_URL)
-        events = data.get('events', [])
-        if not events:
-            await update.message.reply_text("📭 Şu an canlı maç yok.")
-            return
+    data   = await fetch_api(LIVE_URL)
+    events = data.get("events", [])
+    if not events:
+        await update.message.reply_text("📭 Şu an canlı maç yok.")
+        return
 
-        lines = ["⚽ <b>CANLI MAÇLAR</b>", ""]
-        shown = 0
+    sem = asyncio.Semaphore(8)
 
-        for m in events:
-            stype = (m.get("status", {}).get("type") or "").lower()
-            # Bitmiş / başlamamış maçları canlı listeye sokma
-            if stype in ("finished", "ended", "notstarted", "scheduled"):
-                continue
+    async def fetch_minute_for(mid: str):
+        async with sem:
+            r = await fetch_api(MATCH_URL.format(mid))
+            ev = r.get("event", {}) if isinstance(r, dict) else {}
+            return get_real_minute(ev) if ev else None
 
-            m_min = get_real_minute(m)
-            if m_min in ("İY", "MS", "0'"):
-                continue
+    # ilk 20 maçı dene
+    chosen = events[:20]
+    tasks  = []
+    for m in chosen:
+        mid = str(m.get("id", ""))
+        tasks.append(fetch_minute_for(mid))
 
-            h  = html.escape(m.get('homeTeam', {}).get('name', '?') or "?")
-            a  = html.escape(m.get('awayTeam', {}).get('name', '?') or "?")
-            sh = safe_int(m.get('homeScore', {}).get('current', 0))
-            sa = safe_int(m.get('awayScore', {}).get('current', 0))
+    minutes = await asyncio.gather(*tasks, return_exceptions=True)
 
-            lines.append(f"⏱ <code>{m_min}</code> | {h} <b>{sh}-{sa}</b> {a}")
-            shown += 1
-            if shown >= 20:
-                break
+    lines = ["⚽ <b>CANLI MAÇLAR</b>", ""]
+    shown = 0
 
-        if shown == 0:
-            await update.message.reply_text("📭 Şu an listelenecek canlı maç yok.")
-            return
+    for m, mn in zip(chosen, minutes):
+        stype = (m.get("status", {}).get("type") or "").lower()
+        if stype in ("finished", "ended", "notstarted", "scheduled"):
+            continue
 
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
-        )
+        if isinstance(mn, Exception) or not mn:
+            mn = get_real_minute(m)
 
-    except Exception as e:
-        logger.exception("live_command error")
-        await update.message.reply_text(f"/canli hata: {e}")
+        if mn in ("İY", "MS", "0'"):
+            continue
+
+        h  = html.escape(m.get("homeTeam", {}).get("name", "?") or "?")
+        a  = html.escape(m.get("awayTeam", {}).get("name", "?") or "?")
+        sh = safe_int(m.get("homeScore", {}).get("current", 0))
+        sa = safe_int(m.get("awayScore", {}).get("current", 0))
+
+        lines.append(f"⏱ <code>{mn}</code> | {h} <b>{sh}-{sa}</b> {a}")
+        shown += 1
+
+    if shown == 0:
+        await update.message.reply_text("📭 Şu an listelenecek canlı maç yok.")
+        return
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
 
 async def control_command(update: Update,
                            context: ContextTypes.DEFAULT_TYPE):
@@ -575,6 +579,8 @@ async def signal_monitor(app):
                 try:
                     mid   = str(m.get('id', ''))
                     stats = await get_stats(mid)
+                    if stats and stats.get("minute_int", 0) > 0:
+                    mn_int = stats["minute_int"]
 
                     if not stats or not stats.get('has'):
                         continue
