@@ -82,31 +82,56 @@ async def fetch_api(url):
 # ─────────────────────────────────────────
 def get_real_minute(m):
     try:
-        status  = m.get('status', {})
-        desc    = status.get('description', '').lower()
-        elapsed = safe_int(status.get('elapsed', 0))
+        status = m.get("status") or {}
+        stype  = (status.get("type") or "").lower()
+        desc   = (status.get("description") or "").lower()
 
-        if 'ht' in desc:
-            return "İY"
-        if any(x in desc for x in ['ft', 'ended', 'finished']):
+        # maç durumları
+        if stype in ("finished", "ended"):
             return "MS"
+        if stype in ("notstarted", "scheduled"):
+            return "0'"
 
-        if any(x in desc for x in ['2nd', 'second', '2. yarı', 'ikinci']):
-            if elapsed < 45:
-                elapsed += 45
-            elif elapsed == 0:
-                start_ts = m.get('startTimestamp')
+        # devre arası yakalama (description farklı varyantlar)
+        if any(x in desc for x in [
+            "ht", "half-time", "halftime", "interval", "break",
+            "1st half ended", "first half ended"
+        ]):
+            return "İY"
+
+        time_obj = m.get("time") or {}
+        period   = safe_int(time_obj.get("period", 0), 0)  # 1 / 2
+
+        # elapsed: bazı maçlarda 0/None dönebiliyor
+        elapsed = status.get("elapsed", None)
+        elapsed = safe_int(elapsed, 0)
+
+        # mevcut devrenin başlangıç zamanı (en doğru kaynak)
+        cps = (
+            time_obj.get("currentPeriodStartTimestamp")
+            or m.get("currentPeriodStartTimestamp")
+        )
+
+        # elapsed güvenilmezse cps ile hesapla
+        if elapsed <= 0:
+            if cps:
+                elapsed = max(0, (int(time.time()) - int(cps)) // 60)
+            else:
+                # son çare: startTimestamp (devre arası sapıtabilir)
+                start_ts = m.get("startTimestamp")
                 if start_ts:
-                    diff    = (int(time.time()) - start_ts) // 60
-                    elapsed = diff if 0 < diff < 130 else 46
+                    elapsed = max(0, (int(time.time()) - int(start_ts)) // 60)
+                else:
+                    elapsed = 0
 
-        if elapsed <= 1:
-            start_ts = m.get('startTimestamp')
-            if start_ts:
-                diff    = (int(time.time()) - start_ts) // 60
-                elapsed = diff if 0 < diff < 130 else 1
+        # 2. yarıda elapsed genelde 0-45 arası gelir, 45 ekle
+        if period == 2 and elapsed <= 45:
+            minute = 45 + elapsed
+        else:
+            minute = elapsed
 
-        return f"{max(1, elapsed)}'"
+        minute = max(1, min(130, minute))
+        return f"{minute}'"
     except:
         return "0'"
 
@@ -356,14 +381,25 @@ async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Şu an canlı maç yok.")
         return
     text = "⚽ *CANLI MAÇLAR*\n\n"
-    for m in events[:20]:
+    shown = 0
+    for m in events:
+        stype = (m.get("status", {}).get("type") or "").lower()
+        if stype in ("finished", "ended", "notstarted", "scheduled"):
+            continue  # MS ve başlamayanları canlı listede gösterme
+
         m_min = get_real_minute(m)
+        if m_min in ("İY", "MS", "0'"):
+            continue
+
         h  = m.get('homeTeam', {}).get('name', '?')
         a  = m.get('awayTeam', {}).get('name', '?')
         sh = safe_int(m.get('homeScore', {}).get('current', 0))
         sa = safe_int(m.get('awayScore', {}).get('current', 0))
         text += f"⏱ `{m_min}` | {h} *{sh}-{sa}* {a}\n"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+        shown += 1
+        if shown >= 20:
+            break
 
 async def control_command(update: Update,
                            context: ContextTypes.DEFAULT_TYPE):
