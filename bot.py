@@ -133,7 +133,6 @@ def get_real_minute(m):
 
         period = safe_int(time_obj.get("period", 0), 0)
         if period not in (1, 2):
-            # description’dan infer et
             if any(x in desc for x in ["2nd", "second", "2. yar", "ikinci"]):
                 period = 2
             elif any(x in desc for x in ["1st", "first", "1. yar", "birinci"]):
@@ -142,9 +141,9 @@ def get_real_minute(m):
                 period = 0
 
         start_ts = normalize_ts(m.get("startTimestamp"))
-        diff_start = ((now - start_ts) // 60) if start_ts else None
+        # +1: dakika gösterimi (floor yerine “gösterim dakikası”)
+        diff_start = (((now - start_ts) // 60) + 1) if start_ts else None
 
-        # startTimestamp’a bakarak 2. yarıyı tahmin et (LIVE verisi bazen period=0/1 kalıyor)
         if diff_start is not None:
             if diff_start >= 55 and period in (0, 1):
                 period = 2
@@ -156,18 +155,16 @@ def get_real_minute(m):
             or m.get("currentPeriodStartTimestamp")
         )
 
-        # Öncelik: currentPeriodStartTimestamp
         if cps and period in (1, 2):
-            elapsed_period = max(0, (now - cps) // 60)
+            # +1: currentPeriodStartTimestamp üzerinden hesapta da +1
+            elapsed_period = max(0, ((now - cps) // 60) + 1)
             minute = (period - 1) * 45 + elapsed_period
         else:
-            # Fallback: status.elapsed
             elapsed = safe_int(status.get("elapsed", 0), 0)
             if elapsed <= 0 and diff_start is not None:
                 elapsed = diff_start
             minute = elapsed
 
-            # period=2 ise ve elapsed 0-45 arasıysa, 45 ekle
             if period == 2 and minute <= 45 and (diff_start is None or diff_start >= 55):
                 minute += 45
 
