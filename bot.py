@@ -1,7 +1,11 @@
-import os, asyncio, httpx, json, time, logging, re, html
+# bot.py
+
+import os, asyncio, httpx, json, time, logging
+import html
+from telegram.constants import ChatAction
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from telegram.constants import ParseMode, ChatAction
+from telegram.constants import ParseMode
 from brain import BettingBrain
 from dotenv import load_dotenv
 
@@ -36,37 +40,9 @@ GIST_HEADERS = {
 LIVE_URL  = "https://www.sofascore.com/api/v1/sport/football/events/live"
 STATS_URL = "https://www.sofascore.com/api/v1/event/{}/statistics"
 MATCH_URL = "https://www.sofascore.com/api/v1/event/{}"
-ODDS_URL  = "https://www.sofascore.com/api/v1/event/{}/odds/1/all"
 
 last_ai_requests  = []
 MAX_AI_PER_MINUTE = 20
-
-# odds + trend cache
-odds_event_cache = {}     # mid -> (ts, data or None)
-odds_parse_fail_once = set()  # mid set
-match_snapshots  = {}     # mid -> snapshot
-
-# Lig kalite filtresi
-LEAGUE_BLACKLIST = [
-    r"\bu\d{2}\b", r"\bu\d{1}\b",
-    r"youth", r"junior", r"academy",
-    r"reserves?", r"reserve",
-    r"friendly", r"club friendly", r"amistoso",
-]
-LEAGUE_BLACKLIST_RX = [re.compile(p, re.IGNORECASE) for p in LEAGUE_BLACKLIST]
-
-
-def is_league_allowed(m):
-    try:
-        t = m.get("tournament", {}) or {}
-        cat = t.get("category", {}) or {}
-        name = f"{cat.get('name','')} {t.get('name','')}".strip()
-        if not name:
-            return False
-        return not any(rx.search(name) for rx in LEAGUE_BLACKLIST_RX)
-    except:
-        return True
-
 
 # ─────────────────────────────────────────
 # GÜVENLİ SAYI ÇEVİRME
@@ -86,19 +62,37 @@ def safe_float(val, default=0.0):
         return float(str(val).replace('%', '').strip())
     except:
         return default
-
 def normalize_ts(ts):
     try:
         if ts is None:
             return None
         ts = int(ts)
-        # ms gelirse saniyeye indir
-        if ts > 10_000_000_000:
+        # bazen ms gelebiliyor
+        if ts > 10_000_000_000:  # ~2286 yılı saniye eşiği
             ts //= 1000
         return ts
     except:
-        return None
-
+        return None        
+        
+def minute_str_to_int(minute_str: str) -> int:
+    """
+    "45'" -> 45
+    "45+2'" -> 47
+    "90+4'" -> 94
+    "İY/MS/0'" -> 0
+    """
+    try:
+        if not minute_str:
+            return 0
+        s = minute_str.replace("'", "").strip()
+        if s in ("İY", "MS", "0"):
+            return 0
+        if "+" in s:
+            a, b = s.split("+", 1)
+            return safe_int(a, 0) + safe_int(b, 0)
+        return safe_int(s, 0)
+    except:
+        return 0        
 
 # ─────────────────────────────────────────
 # API İSTEĞİ
@@ -116,9 +110,8 @@ async def fetch_api(url):
             logger.error(f"API Hatası ({url}): {e}")
             return {}
 
-
 # ─────────────────────────────────────────
-# DAKİKA HESAPLAMA (stabil +1)
+# DAKİKA HESAPLAMA
 # ─────────────────────────────────────────
 def get_real_minute(m):
     try:
@@ -148,6 +141,7 @@ def get_real_minute(m):
                 period = 0
 
         start_ts = normalize_ts(m.get("startTimestamp"))
+        # +1: dakika gösterimi (floor yerine “gösterim dakikası”)
         diff_start = (((now - start_ts) // 60) + 1) if start_ts else None
 
         if diff_start is not None:
@@ -162,6 +156,7 @@ def get_real_minute(m):
         )
 
         if cps and period in (1, 2):
+            # +1: currentPeriodStartTimestamp üzerinden hesapta da +1
             elapsed_period = max(0, ((now - cps) // 60) + 1)
             minute = (period - 1) * 45 + elapsed_period
         else:
@@ -178,24 +173,28 @@ def get_real_minute(m):
     except:
         return "0'"
 
-
 # ─────────────────────────────────────────
 # GİST YÖNETİMİ
 # ─────────────────────────────────────────
 async def manage_history(mode="read", data=None):
     url = f"https://api.github.com/gists/{GIST_ID}"
     async with gist_lock:
-        async with httpx.AsyncClient(timeout=20.0, headers=GIST_HEADERS) as client:
+        async with httpx.AsyncClient(
+            timeout=20.0, headers=GIST_HEADERS
+        ) as client:
             try:
                 if mode == "read":
                     r = await client.get(url)
                     if r.status_code == 200:
                         files = r.json().get('files', {})
                         if 'sent_signals.json' in files:
-                            return json.loads(files['sent_signals.json']['content'])
+                            return json.loads(
+                                files['sent_signals.json']['content'])
                     return []
                 else:
-                    payload = {"files": {"sent_signals.json": {"content": json.dumps(data)}}}
+                    payload = {"files": {"sent_signals.json": {
+                        "content": json.dumps(data)
+                    }}}
                     r = await client.patch(url, json=payload)
                     if r.status_code != 200:
                         logger.error(f"Gist write: {r.status_code}")
@@ -203,9 +202,8 @@ async def manage_history(mode="read", data=None):
                 logger.error(f"Gist hatası: {e}")
                 return [] if mode == "read" else None
 
-
 # ─────────────────────────────────────────
-# İSTATİSTİK ÇEKİMİ (event'ten xG + dakika + kırmızı kart)
+# İSTATİSTİK ÇEKİMİ
 # ─────────────────────────────────────────
 async def get_stats(match_id):
     stats_url = STATS_URL.format(match_id)
@@ -222,12 +220,12 @@ async def get_stats(match_id):
         'home_saves': 0,     'away_saves': 0,
         'home_big_chances': 0, 'away_big_chances': 0,
         'home_shots_box': 0, 'away_shots_box': 0,
-        'home_red': 0,       'away_red': 0,
-        'minute_str': None,  'minute_int': 0,
         'has': False
     }
 
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=HEADERS) as client:
+    async with httpx.AsyncClient(
+        timeout=15.0, follow_redirects=True, headers=HEADERS
+    ) as client:
         try:
             stats_resp, match_resp = await asyncio.gather(
                 client.get(stats_url),
@@ -238,9 +236,10 @@ async def get_stats(match_id):
             logger.error(f"Paralel istek hatası ({match_id}): {e}")
             return None
 
-    # Stats endpoint
+    # İstatistik endpoint
     try:
-        if (not isinstance(stats_resp, Exception) and stats_resp.status_code == 200):
+        if (not isinstance(stats_resp, Exception)
+                and stats_resp.status_code == 200):
             data = stats_resp.json()
             for p in data.get('statistics', []):
                 if p.get('period') != 'ALL':
@@ -273,164 +272,24 @@ async def get_stats(match_id):
     except Exception as e:
         logger.error(f"Stats parse ({match_id}): {e}")
 
-    # Match endpoint (xG + minute + red cards)
+    # Maç endpoint (xG)
     try:
-        if (not isinstance(match_resp, Exception) and match_resp.status_code == 200):
-            ev = match_resp.json().get('event', {}) or {}
-
+        if (not isinstance(match_resp, Exception)
+                and match_resp.status_code == 200):
+            ev      = match_resp.json().get('event', {})
+            minute_str = get_real_minute(ev)
+            s["minute_str"] = minute_str
+            s["minute_int"] = safe_int(str(minute_str).replace("'", ""), 0)        
             home_xg = ev.get('homeXg')
             away_xg = ev.get('awayXg')
             if home_xg is not None:
                 s['home_xg'] = round(safe_float(home_xg), 2)
             if away_xg is not None:
                 s['away_xg'] = round(safe_float(away_xg), 2)
-
-            # Dakika (event detayından daha doğru)
-            minute_str = get_real_minute(ev)
-            s["minute_str"] = minute_str
-            s["minute_int"] = safe_int(str(minute_str).replace("'", ""), 0)
-
-            # Kırmızı kart (varsa)
-            s["home_red"] = safe_int(ev.get("homeRedCards", 0))
-            s["away_red"] = safe_int(ev.get("awayRedCards", 0))
     except Exception as e:
         logger.error(f"Match parse ({match_id}): {e}")
 
     return s if s['has'] else None
-
-
-# ─────────────────────────────────────────
-# TREND (son snapshot'a göre)
-# ─────────────────────────────────────────
-def compute_trend(mid: str, stats: dict, minute_int: int):
-    try:
-        now = time.time()
-        key = str(mid)
-
-        shots = safe_int(stats.get("home_shots", 0)) + safe_int(stats.get("away_shots", 0))
-        sot   = safe_int(stats.get("home_sot", 0)) + safe_int(stats.get("away_sot", 0))
-        dang  = safe_int(stats.get("home_dangerous", 0)) + safe_int(stats.get("away_dangerous", 0))
-
-        prev = match_snapshots.get(key)
-        match_snapshots[key] = {"t": now, "shots": shots, "sot": sot, "dangerous": dang, "minute": minute_int}
-
-        if not prev:
-            return {"trend_ok": False, "shots_per_min": 0.0, "sot_per_min": 0.0, "danger_per_min": 0.0}
-
-        dm = max(1, minute_int - safe_int(prev.get("minute", minute_int)))
-        dshots = max(0, shots - safe_int(prev.get("shots", shots)))
-        dsot   = max(0, sot   - safe_int(prev.get("sot", sot)))
-        ddang  = max(0, dang  - safe_int(prev.get("dangerous", dang)))
-
-        return {
-            "trend_ok": True,
-            "shots_per_min": round(dshots / dm, 2),
-            "sot_per_min": round(dsot / dm, 2),
-            "danger_per_min": round(ddang / dm, 2),
-        }
-    except:
-        return {"trend_ok": False, "shots_per_min": 0.0, "sot_per_min": 0.0, "danger_per_min": 0.0}
-
-
-# ─────────────────────────────────────────
-# ODDS FETCH + PARSE
-# ─────────────────────────────────────────
-async def fetch_odds_event(mid: str):
-    mid = str(mid)
-    now = time.time()
-    cached = odds_event_cache.get(mid)
-    if cached and now - cached[0] < 180:
-        return cached[1]
-
-    data = await fetch_api(ODDS_URL.format(mid))
-    if not isinstance(data, dict) or not data:
-        odds_event_cache[mid] = (now, None)
-        return None
-
-    odds_event_cache[mid] = (now, data)
-    return data
-
-
-def _find_decimal_odd(obj):
-    if not isinstance(obj, dict):
-        return None
-    for k in ("decimalValue", "decimalOdds", "value", "odds"):
-        v = obj.get(k)
-        if isinstance(v, (int, float)) and v >= 1.01:
-            return float(v)
-    return None
-
-
-def extract_odds_from_event(odds_data: dict, pick: str):
-    if not isinstance(odds_data, dict):
-        return None
-
-    pick_u = str(pick).upper().strip()
-    markets = odds_data.get("markets") or odds_data.get("odds") or []
-    if not isinstance(markets, list):
-        return None
-
-    # Pick parse
-    m_over = re.search(r"^(MS|İY|IY)\s+(\d+(?:\.\d+)?)\s+ÜST$", pick_u)
-    is_btts = (pick_u == "KG VAR")
-    m_corner = re.search(r"^KORNER\s+(\d+(?:\.\d+)?)\s+ÜST$", pick_u)
-    is_1x2 = pick_u in ("MS 1Ç", "MS 2Ç")
-
-    for mk in markets:
-        mname = str(mk.get("marketName") or mk.get("name") or "").lower()
-        choices = mk.get("choices") or mk.get("outcomes") or mk.get("selections") or []
-        if not isinstance(choices, list):
-            continue
-
-        # TOTAL GOALS OVER
-        if m_over:
-            if not any(x in mname for x in ["total goals", "over/under", "goals over/under"]):
-                continue
-            line = m_over.group(2)
-            for ch in choices:
-                cname = str(ch.get("name") or ch.get("choiceName") or "").lower()
-                odd = _find_decimal_odd(ch)
-                if odd and ("over" in cname) and (line in cname):
-                    return odd
-
-        # BTTS YES
-        if is_btts:
-            if not any(x in mname for x in ["both teams to score", "btts"]):
-                continue
-            for ch in choices:
-                cname = str(ch.get("name") or "").lower()
-                odd = _find_decimal_odd(ch)
-                if odd and (("yes" in cname) or ("var" in cname)):
-                    return odd
-
-        # CORNERS OVER
-        if m_corner:
-            if "corner" not in mname:
-                continue
-            line = m_corner.group(1)
-            for ch in choices:
-                cname = str(ch.get("name") or "").lower()
-                odd = _find_decimal_odd(ch)
-                if odd and ("over" in cname) and (line in cname):
-                    return odd
-
-        # 1X2 HOME/AWAY
-        if is_1x2:
-            if not any(x in mname for x in ["match winner", "1x2"]):
-                continue
-            want_home = pick_u.endswith("1Ç")
-            for ch in choices:
-                cname = str(ch.get("name") or "").lower()
-                odd = _find_decimal_odd(ch)
-                if not odd:
-                    continue
-                if want_home and cname in ("1", "home", "ev sahibi"):
-                    return odd
-                if (not want_home) and cname in ("2", "away", "deplasman"):
-                    return odd
-
-    return None
-
 
 # ─────────────────────────────────────────
 # ÖN FİLTRE
@@ -445,14 +304,11 @@ def should_check_match(m, sent_ids):
         if minute_str in ("İY", "MS", "0'"):
             return False, f"Geçersiz dakika: {minute_str}"
 
-        mn_int = safe_int(minute_str.replace("'", ""), 0)
+        mn_int = minute_str_to_int(minute_str)
         if not (10 < mn_int < 85):
             return False, f"Dakika dışı: {mn_int}"
         if not m.get('tournament'):
             return False, "Turnuva bilgisi yok"
-
-        if not is_league_allowed(m):
-            return False, "Lig filtresi"
 
         h_s = safe_int(m.get('homeScore', {}).get('current', 0))
         a_s = safe_int(m.get('awayScore', {}).get('current', 0))
@@ -463,11 +319,11 @@ def should_check_match(m, sent_ids):
     except Exception as e:
         return False, f"Filtre hatası: {e}"
 
-
 # ─────────────────────────────────────────
 # GROQ AI
 # ─────────────────────────────────────────
-async def get_ai_insight(home, away, stats, pick, pressure, minute, score, xg=0.0):
+async def get_ai_insight(home, away, stats, pick,
+                          pressure, minute, score, xg=0.0):
     if not GROQ_KEY:
         return _fallback_comment(home, stats, pick, pressure)
 
@@ -484,14 +340,14 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score, xg=0.
         "Authorization": f"Bearer {GROQ_KEY}",
         "Content-Type":  "application/json"
     }
-
+    # xG satırı: varsa Sofascore home_xg-away_xg, yoksa fonksiyona gelen xg                          
     hxg = safe_float(stats.get("home_xg", 0.0), 0.0) if isinstance(stats, dict) else 0.0
     axg = safe_float(stats.get("away_xg", 0.0), 0.0) if isinstance(stats, dict) else 0.0
+
     if hxg > 0 or axg > 0:
         xg_line = f"{hxg}-{axg}"
     else:
-        xg_line = str(round(safe_float(xg, 0.0), 2))
-
+        xg_line = str(round(safe_float(xg, 0.0), 2))                           
     prompt = (
         "Rol: Profesyonel canlı maç analisti.\n"
         "Çıktı: TAM 2 cümle, Türkçe, kısa ve net.\n"
@@ -509,7 +365,6 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score, xg=0.
         f"Pick: {pick}\n\n"
         "Sadece iki cümleyi yaz:"
     )
-
     payload = {
         "model":       "llama-3.1-8b-instant",
         "messages":    [{"role": "user", "content": prompt}],
@@ -525,27 +380,12 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score, xg=0.
                     json=payload, headers=headers
                 )
                 if r.status_code == 200:
-                    raw = r.json()['choices'][0]['message']['content']
+                    raw   = r.json()['choices'][0]['message']['content']
                     clean = (raw.replace('*', '').replace('_', '')
                                .replace('`', '').replace('[', '')
                                .replace(']', '').strip())
-
-                    # 2 cümleye zorla
-                    import re as _re
-                    clean = _re.sub(r"\s+", " ", clean).strip()
-                    parts = _re.split(r"(?<=[.!?])\s+", clean)
-                    parts = [p.strip() for p in parts if p.strip()]
-                    if len(parts) >= 2:
-                        clean = parts[0] + " " + parts[1]
-                    else:
-                        return _fallback_comment(home, stats, pick, pressure)
-
-                    if len(clean.split()) > 40:
-                        return _fallback_comment(home, stats, pick, pressure)
-
                     logger.info(f"AI → {clean[:60]}...")
                     return clean
-
                 elif r.status_code == 429:
                     await asyncio.sleep(6 * (attempt + 1))
                 else:
@@ -558,16 +398,18 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score, xg=0.
 
 
 def _fallback_comment(home, stats, pick, pressure):
-    hsot = stats.get("home_sot", 0); asot = stats.get("away_sot", 0)
-    hsh  = stats.get("home_shots", 0); ash = stats.get("away_shots", 0)
-    hdan = stats.get("home_dangerous", 0); adan = stats.get("away_dangerous", 0)
-    hcor = stats.get("home_corners", 0); acor = stats.get("away_corners", 0)
-
-    dom = "Ev sahibi" if (hsot + hdan + hsh) >= (asot + adan + ash) else "Deplasman"
-    line1 = f"{dom} SOT {hsot}-{asot}, şut {hsh}-{ash}, tehlikeli {hdan}-{adan}, korner {hcor}-{acor} ile baskın."
-    line2 = f"Bu tempo ve %{pressure} baskı, {pick} seçimini değerli kılar."
-    return f"{line1} {line2}"
-
+    import random
+    sot  = stats.get('home_sot', 0)
+    shots= stats.get('home_shots', 0)
+    corn = stats.get('home_corners', 0)
+    dan  = stats.get('home_dangerous', 0)
+    opts = [
+        f"{home} {sot} isabetli şut ve {dan} tehlikeli atakla baskı kuruyor. {pick} için istatistikler uygun.",
+        f"{shots} şut denemesinden {sot} tanesi kaleyi buldu. Baskı %{pressure} ile kritik eşikte.",
+        f"{home} {sot} isabetli şut ve {corn} kornerle kapıyı zorluyor. {pick} hesaplanmış seçim.",
+        f"Tehlikeli atak sayısı ve isabetli şut oranı baskıyı doğruluyor. {pick} bu veriyle değer taşıyor.",
+    ]
+    return random.choice(opts)
 
 # ─────────────────────────────────────────
 # KOMUTLAR
@@ -580,78 +422,74 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
-
 async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action=ChatAction.TYPING
-        )
-
-        data   = await fetch_api(LIVE_URL)
-        events = data.get("events", [])
-        if not events:
-            await update.message.reply_text("📭 Şu an canlı maç yok.")
-            return
-
-        # Dakika doğruluğu için event/{id} üzerinden ilk 20 maçı netleştir
-        sem = asyncio.Semaphore(10)
-
-        async def fetch_minute_for(mid: str):
-            async with sem:
-                r = await fetch_api(MATCH_URL.format(mid))
-                ev = r.get("event", {}) if isinstance(r, dict) else {}
-                return get_real_minute(ev) if ev else None
-
-        chosen = events[:20]
-        tasks  = [fetch_minute_for(str(m.get("id", ""))) for m in chosen]
-        minutes = await asyncio.gather(*tasks, return_exceptions=True)
-
-        lines = ["⚽ <b>CANLI MAÇLAR</b>", ""]
-        shown = 0
-
-        for m, mn in zip(chosen, minutes):
-            stype = (m.get("status", {}).get("type") or "").lower()
-            if stype in ("finished", "ended", "notstarted", "scheduled"):
-                continue
-
-            if isinstance(mn, Exception) or not mn:
-                mn = get_real_minute(m)
-
-            if mn in ("İY", "MS", "0'"):
-                continue
-
-            h  = html.escape(m.get("homeTeam", {}).get("name", "?") or "?")
-            a  = html.escape(m.get("awayTeam", {}).get("name", "?") or "?")
-            sh = safe_int(m.get("homeScore", {}).get("current", 0))
-            sa = safe_int(m.get("awayScore", {}).get("current", 0))
-
-            lines.append(f"⏱ <code>{mn}</code> | {h} <b>{sh}-{sa}</b> {a}")
-            shown += 1
-
-        if shown == 0:
-            await update.message.reply_text("📭 Şu an listelenecek canlı maç yok.")
-            return
-
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
-        )
-    except Exception as e:
-        logger.exception("live_command error")
-        await update.message.reply_text(f"/canli hata: {e}")
-
-
-async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text(
-        "🔎 *Sistem Denetleniyor...*", parse_mode=ParseMode.MARKDOWN
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
     )
 
+    data   = await fetch_api(LIVE_URL)
+    events = data.get("events", [])
+    if not events:
+        await update.message.reply_text("📭 Şu an canlı maç yok.")
+        return
+
+    sem = asyncio.Semaphore(8)
+
+    async def fetch_minute_for(mid: str):
+        async with sem:
+            r = await fetch_api(MATCH_URL.format(mid))
+            ev = r.get("event", {}) if isinstance(r, dict) else {}
+            return get_real_minute(ev) if ev else None
+
+    # ilk 20 maçı dene
+    chosen = events[:20]
+    tasks  = []
+    for m in chosen:
+        mid = str(m.get("id", ""))
+        tasks.append(fetch_minute_for(mid))
+
+    minutes = await asyncio.gather(*tasks, return_exceptions=True)
+
+    lines = ["⚽ <b>CANLI MAÇLAR</b>", ""]
+    shown = 0
+
+    for m, mn in zip(chosen, minutes):
+        stype = (m.get("status", {}).get("type") or "").lower()
+        if stype in ("finished", "ended", "notstarted", "scheduled"):
+            continue
+
+        if isinstance(mn, Exception) or not mn:
+            mn = get_real_minute(m)
+
+        if mn in ("İY", "MS", "0'"):
+            continue
+
+        h  = html.escape(m.get("homeTeam", {}).get("name", "?") or "?")
+        a  = html.escape(m.get("awayTeam", {}).get("name", "?") or "?")
+        sh = safe_int(m.get("homeScore", {}).get("current", 0))
+        sa = safe_int(m.get("awayScore", {}).get("current", 0))
+
+        lines.append(f"⏱ <code>{mn}</code> | {h} <b>{sh}-{sa}</b> {a}")
+        shown += 1
+
+    if shown == 0:
+        await update.message.reply_text("📭 Şu an listelenecek canlı maç yok.")
+        return
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+
+async def control_command(update: Update,
+                           context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text(
+        "🔎 *Sistem Denetleniyor...*", parse_mode=ParseMode.MARKDOWN)
     api_data  = await fetch_api(LIVE_URL)
     gist_data = await manage_history("read")
-
-    ai_test = await get_ai_insight(
+    ai_test   = await get_ai_insight(
         "TestA", "TestB",
         {'home_sot': 3, 'away_sot': 1, 'home_shots': 8,
          'away_shots': 3, 'home_corners': 4, 'away_corners': 1,
@@ -660,38 +498,24 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
          'home_big_chances': 2, 'away_big_chances': 0},
         "MS 1.5 ÜST", 70, 55, "1-0", 1.2
     )
-
     delivery = "✅ OK"
     try:
         await context.bot.send_message(chat_id=CHAT_ID, text="🧪 Test")
     except:
         delivery = "❌ HATA"
 
-    # ODDS TEST
-    odds_status = "⚠️ N/A"
-    try:
-        evs = api_data.get("events", []) if isinstance(api_data, dict) else []
-        if evs:
-            test_id = str(evs[0].get("id", ""))
-            od = await fetch_odds_event(test_id)
-            markets = (od.get("markets") or od.get("odds")) if isinstance(od, dict) else None
-            odds_status = "✅ OK" if markets else "❌ FAIL"
-    except:
-        odds_status = "❌ FAIL"
-
     report = (
         f"🛡 *BOT DENETİM RAPORU*\n\n"
         f"🌐 API: {'✅ OK' if api_data else '❌ HATA'}\n"
         f"💾 Gist: {'✅ OK' if isinstance(gist_data, list) else '❌ HATA'}\n"
         f"🧠 AI: {'✅ OK' if len(ai_test) > 10 else '❌ HATA'}\n"
-        f"🎲 Odds: {odds_status}\n"
         f"📩 İletim: {delivery}\n"
-        f"⚽ Canlı Maç: {len(api_data.get('events', [])) if isinstance(api_data, dict) else 0}\n"
-        f"📊 Kayıtlı Sinyal: {len(gist_data) if isinstance(gist_data, list) else 0}\n\n"
+        f"⚽ Canlı Maç: {len(api_data.get('events', []))}\n"
+        f"📊 Kayıtlı Sinyal: "
+        f"{len(gist_data) if isinstance(gist_data, list) else 0}\n\n"
         f"🚀 _Sistem aktif!_"
     )
     await msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
-
 
 # ─────────────────────────────────────────
 # SONUÇ TAKİPÇİSİ
@@ -707,11 +531,15 @@ async def result_tracker(app):
             for sig in history[-20:]:
                 if (sig.get('status') == 'pending' and
                         time.time() - sig.get('timestamp', 0) > 3600):
-                    r  = await fetch_api(MATCH_URL.format(sig['id']))
-                    ev = r.get('event', {}) if isinstance(r, dict) else {}
+                    r  = await fetch_api(
+                        f"https://www.sofascore.com/api/v1/event/{sig['id']}"
+                    )
+                    ev = r.get('event', {})
                     if ev.get('status', {}).get('type') == 'finished':
-                        hs  = safe_int(ev.get('homeScore', {}).get('current', 0))
-                        as_ = safe_int(ev.get('awayScore', {}).get('current', 0))
+                        hs  = safe_int(
+                            ev.get('homeScore', {}).get('current', 0))
+                        as_ = safe_int(
+                            ev.get('awayScore', {}).get('current', 0))
                         is_win = (hs + as_) > sig.get('start_total', 0)
                         sig['status']      = 'WIN ✅' if is_win else 'LOSS ❌'
                         sig['final_score'] = f"{hs}-{as_}"
@@ -725,7 +553,6 @@ async def result_tracker(app):
 
         await asyncio.sleep(600)
 
-
 # ─────────────────────────────────────────
 # SİNYAL MONİTÖRÜ
 # ─────────────────────────────────────────
@@ -734,12 +561,12 @@ async def signal_monitor(app):
     while True:
         try:
             data    = await fetch_api(LIVE_URL)
-            events  = data.get('events', []) if isinstance(data, dict) else []
+            events  = data.get('events', [])
             history = await manage_history("read")
             if not isinstance(history, list):
                 history = []
 
-            sent_ids   = {str(x['id']) for x in history if 'id' in x}
+            sent_ids   = {str(x['id']) for x in history}
             candidates = []
 
             for m in events:
@@ -748,104 +575,37 @@ async def signal_monitor(app):
                     candidates.append((m, result))
 
             logger.info(
-                f"📊 {len(events)} maç → {len(candidates)} aday → {len(history)} sinyal kayıtlı"
+                f"📊 {len(events)} maç → "
+                f"{len(candidates)} aday → "
+                f"{len(history)} sinyal kayıtlı"
             )
 
             for m, mn_int in candidates:
                 try:
                     mid   = str(m.get('id', ''))
                     stats = await get_stats(mid)
+                    if stats and stats.get("minute_int", 0) > 0:
+                        mn_int = stats["minute_int"]
 
                     if not stats or not stats.get('has'):
                         continue
 
-                    # event detay dakikası daha doğruysa override et
-                    if stats.get("minute_int", 0) > 0:
-                        mn_int = stats["minute_int"]
-
-                    trend = compute_trend(mid, stats, mn_int)
-
-                    res = brain.analyze_advanced(m, stats, mn_int, trend=trend)
+                    res = brain.analyze_advanced(m, stats, mn_int)
 
                     if not res.get('is_signal'):
                         logger.info(f"⏭ {res.get('reason', '?')}")
                         continue
 
-                    # Oran yoksa maç es geç
-                    odds_data = await fetch_odds_event(mid)
-                    if not odds_data:
-                        logger.info("⏭ Oran yok, maç es geçildi.")
-                        continue
-
-                    # Brain pick + alt picklerden (ilk 4) value seç
-                    candidate_picks = [res["pick"]]
-                    for p in res.get("alt", []):
-                        if not p:
-                            continue
-                        p_label = p[0]
-                        if p_label and p_label != res["pick"]:
-                            candidate_picks.append(p_label)
-
-                    # uniq + limit
-                    uniq = []
-                    for p in candidate_picks:
-                        if p not in uniq:
-                            uniq.append(p)
-                    candidate_picks = uniq[:4]
-
-                    best_choice = None
-                    prob_map = res.get("pick_probs", {}) or {}
-
-                    for pck in candidate_picks:
-                        odd = extract_odds_from_event(odds_data, pck)
-                        if not odd:
-                            continue
-                        if odd < brain.MIN_ODDS:
-                            continue
-
-                        pick_prob = prob_map.get(pck, res.get("prob", 60))
-                        model_p = float(pick_prob) / 100.0
-                        implied = 1.0 / float(odd)
-                        value = model_p - implied
-
-                        if value < 0.03:
-                            continue
-
-                        if (best_choice is None) or (value > best_choice["value"]):
-                            best_choice = {
-                                "pick": pck,
-                                "odds": float(odd),
-                                "value": float(value),
-                                "pick_prob": int(pick_prob)
-                            }
-                            
-                        if not best_choice:
-                            # Odds geldi ama hiçbir pick için oran bulamadık mı? (Parser kaçırıyor olabilir)
-                            key = str(mid)
-                            if key not in odds_parse_fail_once:
-                                odds_parse_fail_once.add(key)
-                                mkts = odds_data.get("markets") or odds_data.get("odds") or []
-                                names = []
-                                if isinstance(mkts, list):
-                                    for mk in mkts[:15]:
-                                        names.append(str(mk.get("marketName") or mk.get("name") or "?"))
-                            logger.info(f"ODDS PARSE FAIL mid={mid} picks={candidate_picks} markets={names}")
-                        continue
-
-                    # seçimi güncelle
-                    res["pick"]  = best_choice["pick"]
-                    res["odds"]  = round(best_choice["odds"], 2)
-                    res["value"] = round(best_choice["value"], 3)
-                    res["prob"]  = int(best_choice["pick_prob"])
-
                     home_name = m.get('homeTeam', {}).get('name', '?')
                     away_name = m.get('awayTeam', {}).get('name', '?')
-                    league    = m.get('tournament', {}).get('name', 'Bilinmiyor')
+                    league    = m.get('tournament', {}).get(
+                        'name', 'Bilinmiyor')
                     xg_val    = res.get('xg', 0.0)
                     momentum  = res.get('momentum', 0)
 
                     logger.info(
-                        f"🔍 Sinyal: {home_name} vs {away_name} | {mn_int}' | {res['pick']} @ {res['odds']} (v:{res['value']})"
+                        f"🔍 Sinyal: {home_name} vs {away_name} "
+                        f"| {mn_int}' | {res['pick']}"
                     )
 
                     ai_msg = await get_ai_insight(
@@ -854,36 +614,34 @@ async def signal_monitor(app):
                         mn_int, res['score'], xg_val
                     )
 
-                    # Alternatifler
-                    alt_picks = [p for p in res.get('alt', []) if p and p[0] != res['pick']]
-                    alt_lines = []
-                    for p in alt_picks[:2]:
-                        p_label = p[0]
-                        p_risk  = p[2]
-                        p_prob  = p[3]
-                        if p_prob is not None:
-                            alt_lines.append(f"  • {p_label} (Risk: {p_risk}, Model: {p_prob}%)")
-                        else:
-                            alt_lines.append(f"  • {p_label} (Risk: {p_risk})")
-
-                    alt_section = f"\n💡 *ALTERNATİF*\n" + "\n".join(alt_lines) + "\n" if alt_lines else ""
+                    alt_picks = [p for p in res.get('alt', [])
+                                 if p[0] != res['pick']]
+                    alt_txt   = "".join(
+                        [f"  • {p[0]} (Risk: {p[2]})\n"
+                         for p in alt_picks[:2]]
+                    )
+                    alt_section = (
+                        f"\n💡 *ALTERNATİF*\n{alt_txt}" if alt_txt else ""
+                    )
 
                     bar_val = max(0, min(100, res['pressure']))
-                    bar     = ("🟩" * (bar_val // 10) + "⬜" * (10 - bar_val // 10))
+                    bar     = ("🟩" * (bar_val // 10) +
+                               "⬜" * (10 - bar_val // 10))
 
                     confirms = res.get('confirmations', [])
                     conf_txt = " · ".join(confirms[:3])
 
-                    period_emoji = "1️⃣" if res['period'] == "1. YARI" else "2️⃣"
+                    period_emoji = (
+                        "1️⃣" if res['period'] == "1. YARI" else "2️⃣"
+                    )
 
+                    # xG kaynağı
                     h_xg = stats.get('home_xg', 0.0)
                     a_xg = stats.get('away_xg', 0.0)
                     if h_xg > 0 or a_xg > 0:
                         xg_line = f"`{h_xg} - {a_xg}` (Sofascore)"
                     else:
                         xg_line = f"`{xg_val}` (tahmini)"
-
-                    odds_value_line = f"🎲 *Oran:* `{res['odds']}` | 📈 *Value:* `{res['value']}`\n"
 
                     txt = (
                         f"📡 *SİNYAL* | {time.strftime('%H:%M')}\n"
@@ -893,18 +651,24 @@ async def signal_monitor(app):
                         f"⏱ `{mn_int}'` {period_emoji} {res['period']}\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🎯 *TAHMİN:* `{res['pick']}`\n"
-                        f"{odds_value_line}"
                         f"📊 *Güven:* {res['confidence']} `{res['prob']}%`\n"
                         f"⚠️ *Risk:* `{res['risk']}`\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"📈 *İSTATİSTİKLER*\n"
-                        f"┌ 🥅 İsabetli Şut: `{stats['home_sot']} - {stats['away_sot']}`\n"
-                        f"├ ⚡ Toplam Şut:   `{stats['home_shots']} - {stats['away_shots']}`\n"
-                        f"├ 🚩 Korner:      `{stats['home_corners']} - {stats['away_corners']}`\n"
-                        f"├ 🎮 Hakimiyet:   `%{stats['home_poss']} - %{stats['away_poss']}`\n"
-                        f"├ 🔥 Teh. Atak:   `{stats['home_dangerous']} - {stats['away_dangerous']}`\n"
-                        f"├ 💥 Büyük Fırsat:`{stats['home_big_chances']} - {stats['away_big_chances']}`\n"
-                        f"└ 🧤 Kurtarış:    `{stats['home_saves']} - {stats['away_saves']}`\n"
+                        f"┌ 🥅 İsabetli Şut: "
+                        f"`{stats['home_sot']} - {stats['away_sot']}`\n"
+                        f"├ ⚡ Toplam Şut:   "
+                        f"`{stats['home_shots']} - {stats['away_shots']}`\n"
+                        f"├ 🚩 Korner:      "
+                        f"`{stats['home_corners']} - {stats['away_corners']}`\n"
+                        f"├ 🎮 Hakimiyet:   "
+                        f"`%{stats['home_poss']} - %{stats['away_poss']}`\n"
+                        f"├ 🔥 Teh. Atak:   "
+                        f"`{stats['home_dangerous']} - {stats['away_dangerous']}`\n"
+                        f"├ 💥 Büyük Fırsat:"
+                        f"`{stats['home_big_chances']} - {stats['away_big_chances']}`\n"
+                        f"└ 🧤 Kurtarış:    "
+                        f"`{stats['home_saves']} - {stats['away_saves']}`\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🔥 *BASKI:* {bar} `%{res['pressure']}`\n"
                         f"📐 *xG:* {xg_line}\n"
@@ -919,26 +683,20 @@ async def signal_monitor(app):
                     )
 
                     await app.bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=txt,
+                        chat_id=CHAT_ID, text=txt,
                         parse_mode=ParseMode.MARKDOWN
                     )
-
                     history.append({
                         "id":          mid,
                         "timestamp":   time.time(),
                         "status":      "pending",
                         "start_total": res['total_score'],
                         "match":       f"{home_name} vs {away_name}",
-                        "pick":        res['pick'],
-                        "odds":        res.get("odds"),
-                        "value":       res.get("value"),
-                        "prob":        res.get("prob")
+                        "pick":        res['pick']
                     })
                     await manage_history("write", history)
                     sent_ids.add(mid)
-
-                    logger.info(f"✅ Sinyal: {res['pick']} @ {res['odds']} (v:{res['value']})")
+                    logger.info(f"✅ Sinyal: {res['pick']}")
                     await asyncio.sleep(2)
 
                 except Exception as e:
@@ -950,14 +708,6 @@ async def signal_monitor(app):
 
         await asyncio.sleep(180)
 
-
-# ─────────────────────────────────────────
-# ERROR HANDLER
-# ─────────────────────────────────────────
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Update handling error", exc_info=context.error)
-
-
 # ─────────────────────────────────────────
 # BAŞLATMA
 # ─────────────────────────────────────────
@@ -965,7 +715,10 @@ async def post_init(app):
     asyncio.create_task(result_tracker(app))
     asyncio.create_task(signal_monitor(app))
     logger.info("✅ Görevler başladı.")
-
+    
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    # context.error zaten exception objesi
+    logger.error("Update handling error", exc_info=context.error)    
 
 if __name__ == "__main__":
     app = (
