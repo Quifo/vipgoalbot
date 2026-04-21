@@ -43,6 +43,7 @@ MAX_AI_PER_MINUTE = 20
 
 # odds + trend cache
 odds_event_cache = {}     # mid -> (ts, data or None)
+odds_parse_fail_once = set()  # mid set
 match_snapshots  = {}     # mid -> snapshot
 
 # Lig kalite filtresi
@@ -817,9 +818,18 @@ async def signal_monitor(app):
                                 "value": float(value),
                                 "pick_prob": int(pick_prob)
                             }
-
-                    if not best_choice:
-                        logger.info("⏭ Uygun oran/value bulunamadı.")
+                            
+                        if not best_choice:
+                            # Odds geldi ama hiçbir pick için oran bulamadık mı? (Parser kaçırıyor olabilir)
+                            key = str(mid)
+                            if key not in odds_parse_fail_once:
+                                odds_parse_fail_once.add(key)
+                                mkts = odds_data.get("markets") or odds_data.get("odds") or []
+                                names = []
+                                if isinstance(mkts, list):
+                                    for mk in mkts[:15]:
+                                        names.append(str(mk.get("marketName") or mk.get("name") or "?"))
+                            logger.info(f"ODDS PARSE FAIL mid={mid} picks={candidate_picks} markets={names}")
                         continue
 
                     # seçimi güncelle
