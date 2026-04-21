@@ -340,6 +340,14 @@ async def get_ai_insight(home, away, stats, pick,
         "Authorization": f"Bearer {GROQ_KEY}",
         "Content-Type":  "application/json"
     }
+    # xG satırı: varsa Sofascore home_xg-away_xg, yoksa fonksiyona gelen xg                          
+    hxg = safe_float(stats.get("home_xg", 0.0), 0.0) if isinstance(stats, dict) else 0.0
+    axg = safe_float(stats.get("away_xg", 0.0), 0.0) if isinstance(stats, dict) else 0.0
+
+    if hxg > 0 or axg > 0:
+        xg_line = f"{hxg}-{axg}"
+    else:
+        xg_line = str(round(safe_float(xg, 0.0), 2))                           
     prompt = (
         "Rol: Profesyonel canlı maç analisti.\n"
         "Çıktı: TAM 2 cümle, Türkçe, kısa ve net.\n"
