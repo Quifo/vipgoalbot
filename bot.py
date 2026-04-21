@@ -1,6 +1,8 @@
 # bot.py
 
 import os, asyncio, httpx, json, time, logging
+import html
+from telegram.constants import ParseMode, ChatAction
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -423,33 +425,54 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_chat_action("typing")
-    data   = await fetch_api(LIVE_URL)
-    events = data.get('events', [])
-    if not events:
-        await update.message.reply_text("📭 Şu an canlı maç yok.")
-        return
-    text = "⚽ *CANLI MAÇLAR*\n\n"
-    shown = 0
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.TYPING
+        )
 
-    for m in events:
-        stype = (m.get("status", {}).get("type") or "").lower()
-        if stype in ("finished", "ended", "notstarted", "scheduled"):
-            continue
+        data   = await fetch_api(LIVE_URL)
+        events = data.get('events', [])
+        if not events:
+            await update.message.reply_text("📭 Şu an canlı maç yok.")
+            return
 
-        m_min = get_real_minute(m)
-        if m_min in ("İY", "MS", "0'"):
-            continue
+        lines = ["⚽ <b>CANLI MAÇLAR</b>", ""]
+        shown = 0
 
-        h  = m.get('homeTeam', {}).get('name', '?')
-        a  = m.get('awayTeam', {}).get('name', '?')
-        sh = safe_int(m.get('homeScore', {}).get('current', 0))
-        sa = safe_int(m.get('awayScore', {}).get('current', 0))
+        for m in events:
+            stype = (m.get("status", {}).get("type") or "").lower()
+            # Bitmiş / başlamamış maçları canlı listeye sokma
+            if stype in ("finished", "ended", "notstarted", "scheduled"):
+                continue
 
-        text += f"⏱ `{m_min}` | {h} *{sh}-{sa}* {a}\n"
-        shown += 1
-        if shown >= 20:
-            break
+            m_min = get_real_minute(m)
+            if m_min in ("İY", "MS", "0'"):
+                continue
+
+            h  = html.escape(m.get('homeTeam', {}).get('name', '?') or "?")
+            a  = html.escape(m.get('awayTeam', {}).get('name', '?') or "?")
+            sh = safe_int(m.get('homeScore', {}).get('current', 0))
+            sa = safe_int(m.get('awayScore', {}).get('current', 0))
+
+            lines.append(f"⏱ <code>{m_min}</code> | {h} <b>{sh}-{sa}</b> {a}")
+            shown += 1
+            if shown >= 20:
+                break
+
+        if shown == 0:
+            await update.message.reply_text("📭 Şu an listelenecek canlı maç yok.")
+            return
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+
+    except Exception as e:
+        logger.exception("live_command error")
+        await update.message.reply_text(f"/canli hata: {e}")
 
 async def control_command(update: Update,
                            context: ContextTypes.DEFAULT_TYPE):
@@ -693,6 +716,10 @@ if __name__ == "__main__":
         .pool_timeout(30)
         .build()
     )
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Update handling error", exc_info=context.error)
+
+app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start",   start_command))
     app.add_handler(CommandHandler("canli",   live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
