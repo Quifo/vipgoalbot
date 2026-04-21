@@ -704,6 +704,10 @@ async def post_init(app):
     asyncio.create_task(result_tracker(app))
     asyncio.create_task(signal_monitor(app))
     logger.info("✅ Görevler başladı.")
+    
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    # context.error zaten exception objesi
+    logger.error("Update handling error", exc_info=context.error)    
 
 if __name__ == "__main__":
     app = (
@@ -716,13 +720,13 @@ if __name__ == "__main__":
         .pool_timeout(30)
         .build()
     )
-    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Update handling error", exc_info=context.error)
 
-app.add_error_handler(error_handler)
+    app.add_error_handler(error_handler)
+
     app.add_handler(CommandHandler("start",   start_command))
     app.add_handler(CommandHandler("canli",   live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
+
     logger.info("✅ Bot hazır!")
     app.run_polling(
         drop_pending_updates=True,
