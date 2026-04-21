@@ -580,7 +580,7 @@ async def signal_monitor(app):
                     mid   = str(m.get('id', ''))
                     stats = await get_stats(mid)
                     if stats and stats.get("minute_int", 0) > 0:
-                    mn_int = stats["minute_int"]
+                        mn_int = stats["minute_int"]
 
                     if not stats or not stats.get('has'):
                         continue
