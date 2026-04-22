@@ -515,67 +515,70 @@ async def signal_monitor(app):
 
                     logger.info(f"🔍 Sinyal: {home_name} vs {away_name} | {mn_int}' | {res['pick']}")
 
-                    ai_msg = await get_ai_insight(home_name, away_name, stats, res['pick'], res['pressure'], mn_int, res['score'], xg_val, pick_type)
+                    ai_msg = await get_ai_insight(
+                        home_name, away_name, stats, res['pick'], 
+                        res['pressure'], mn_int, res['score'], xg_val, pick_type
+                    )
 
+                    # Alternatifleri formatla
                     alt_picks = res.get('alt', [])
                     alt_txt = ""
                     if alt_picks:
                         alt_lines = []
                         for p in alt_picks[:2]:
+                            # p = (name, odds, risk, type)
                             bet_name = p[0]
-                            odds = p[1]
-                            risk = p[2]
-                            risk_emoji = {"Düşük": "🟢", "Orta": "🟡", "Yüksek": "🔴", "Çok Düşük": "🟢"}.get(risk, "⚪")
-                            alt_lines.append(f"  {risk_emoji} `{bet_name}` @ {odds} ({risk})")
+                            alt_lines.append(f"  - {bet_name}")
                         if alt_lines:
-                            alt_txt = "\n💡 *ALTERNATİF STRATEJİLER*\n" + "\n".join(alt_lines) + "\n"
+                            alt_txt = "\n💡 *Alternatif Tercihler:*\n" + "\n".join(alt_lines)
 
-                    bar_val = max(0, min(100, res['pressure']))
-                    bar = ("🟩" * (bar_val // 10) + "⬜" * (10 - bar_val // 10))
-                    conf_txt = " · ".join(res.get('confirmations', [])[:3])
-                    period_emoji = "1️⃣" if res['period'] == "1. YARI" else "2️⃣"
+                    period_emoji = "2️⃣" if res['period'] == "2. YARI" else "1️⃣"
                     
-                    h_xg = stats.get('home_xg', 0.0)
-                    a_xg = stats.get('away_xg', 0.0)
-                    xg_line = f"`{h_xg} - {a_xg}` (Sofascore)" if (h_xg > 0 or a_xg > 0) else f"`{xg_val}` (tahmini)"
+                    # İstatistikleri hazırla
+                    h_sot = stats.get('home_sot', 0)
+                    a_sot = stats.get('away_sot', 0)
+                    h_shots = stats.get('home_shots', 0)
+                    a_shots = stats.get('away_shots', 0)
+                    h_corners = stats.get('home_corners', 0)
+                    a_corners = stats.get('away_corners', 0)
+                    h_poss = stats.get('home_poss', 50)
+                    a_poss = stats.get('away_poss', 50)
+                    h_big = stats.get('home_big_chances', 0)
+                    a_big = stats.get('away_big_chances', 0)
+                    h_saves = stats.get('home_saves', 0)
+                    a_saves = stats.get('away_saves', 0)
 
-                    bet_emojis = {"iy": "⏱", "ms": "🏁", "kg": "⚽", "corner": "🚩", "team": "🎯", "handicap": "📊", "taraf": "🥅"}
-                    bet_emoji = bet_emojis.get(pick_type, "🎯")
-
-                    # ESKİ GÜZEL FORMAT
+                    # YENİ FORMAT
                     txt = (
-                        f"📡 *SİNYAL* {bet_emoji} | {time.strftime('%H:%M')}\n"
+                        f"📡 *SİNYAL*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"⚽ *{home_name}* `{res['score']}` *{away_name}*\n"
+                        f"⚽️ *{home_name}* {res['score']} *{away_name}*\n"
                         f"🏆 _{league}_\n"
-                        f"⏱ `{mn_int}'` {period_emoji} {res['period']}\n"
+                        f"⏱️ `{mn_int}'` {period_emoji} {res['period']}\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🎯 *STRATEJİ:* `{res['pick']}`\n"
+                        f"🎯 *Ana Bahis:* `{res['pick']}`\n"
                         f"📊 *Güven:* {res['confidence']} `{res['prob']}%`\n"
-                        f"⚠️ *Risk:* `{res['risk']}`\n"
+                        f"⚠️ *Risk:* `{res['risk']}`"
+                        f"{alt_txt}\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"📈 *İSTATİSTİKLER*\n"
-                        f"┌ 🥅 İsabetli Şut: `{stats['home_sot']} - {stats['away_sot']}`\n"
-                        f"├ ⚡ Toplam Şut:   `{stats['home_shots']} - {stats['away_shots']}`\n"
-                        f"├ 🚩 Korner:      `{stats['home_corners']} - {stats['away_corners']}`\n"
-                        f"├ 🎮 Hakimiyet:   `%{stats['home_poss']} - %{stats['away_poss']}`\n"
-                        f"├ 🔥 Teh. Atak:   `{stats['home_dangerous']} - {stats['away_dangerous']}`\n"
-                        f"├ 💥 Büyük Fırsat: `{stats['home_big_chances']} - {stats['away_big_chances']}`\n"
-                        f"└ 🧤 Kurtarış:    `{stats['home_saves']} - {stats['away_saves']}`\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🔥 *BASKI:* {bar} `%{res['pressure']}`\n"
-                        f"📐 *xG:* {xg_line}\n"
-                        f"⚡ *Momentum:* `{momentum}`\n"
-                        f"👊 *Üstün:* {res['team']}\n"
-                        f"✅ _{conf_txt}_\n"
+                        f"┌ 🥅 İsabetli Şut: `{h_sot} - {a_sot}`\n"
+                        f"├ ⚡️ Toplam Şut:   `{h_shots} - {a_shots}`\n"
+                        f"├ 🚩 Korner:      `{h_corners} - {a_corners}`\n"
+                        f"├ 🎮 Hakimiyet:   `%{h_poss} - %{a_poss}`\n"
+                        f"├ 💥 Büyük Fırsat: `{h_big} - {a_big}`\n"
+                        f"└ 🧤 Kurtarış:    `{h_saves} - {a_saves}`\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🧠 *ANALİZ:* _{ai_msg}_\n"
-                        f"{alt_txt}"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"💎 _VIP Pro Trader_"
+                        f"💎 *VIP Pro Trader*"
                     )
 
-                    await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
+                    await app.bot.send_message(
+                        chat_id=CHAT_ID, 
+                        text=txt, 
+                        parse_mode=ParseMode.MARKDOWN
+                    )
                     
                     history.append({
                         "id": mid,
@@ -598,7 +601,7 @@ async def signal_monitor(app):
             logger.error(f"Monitör hatası: {e}")
 
         await asyncio.sleep(180)
-
+        
 async def post_init(app):
     asyncio.create_task(result_tracker(app))
     asyncio.create_task(signal_monitor(app))
