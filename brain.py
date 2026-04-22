@@ -454,10 +454,27 @@ class BettingBrain:
             picks = []
             total_c = (self._safe_get(stats, 'home_corners') + self._safe_get(stats, 'away_corners'))
 
+    def _phase1_prefilter(self, m, stats, minute):
+        try:
+            reasons = []
+            minute  = self._safe_int(minute, 0)
+            h_s = self._safe_get_team(m, 'home', 'current')
+            a_s = self._safe_get_team(m, 'away', 'current')
+            curr_score = h_s + a_s
+
+        # ... mevcut kontroller ...
+
+        # MANTIKSIZ BAHİS KONTROLÜ
+        if curr_score >= 1 and minute <= 45:
+            # Eğer ilk yarıda zaten gol varsa, 0.5 üst önermeye çalışma
+            pass  # Burada sadece 1.5 üst veya KG var önerilebilir
+        
+        return len(reasons) == 0, reasons
+
             # ═══════════════════════════════════════
             # 1. İLK YARI BAHİSLERİ (Dakika <= 40)
             # ═══════════════════════════════════════
-            if minute <= 40 and curr_score <= 1:
+            if minute <= 40 and curr_score <= 0:
                 # İY 0.5 ÜST
                 if dom['sot'] >= 2 and dom_xg >= 0.4:
                     v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'iy_ust', dom_xg, curr_score)
@@ -465,13 +482,13 @@ class BettingBrain:
                         picks.append(("İY 0.5 ÜST", 1.70, "Düşük", v, "iy"))
                 
                 # İY 1.5 ÜST (Agresif)
-                if dom['sot'] >= 3 and dom['shots'] >= 7 and dom_xg >= 0.7 and curr_score == 0:
+                if dom['sot'] >= 3 and dom['shots'] >= 7 and dom_xg >= 0.7 and curr_score == 1:
                     v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'iy_ust_15', dom_xg, curr_score)
                     if v >= self.MIN_VALUE_SCORE + 5:
                         picks.append(("İY 1.5 ÜST", 2.20, "Orta", v, "iy"))
                 
                 # İY KG VAR
-                if total_xg >= 1.0 and rec['sot'] >= 1 and dom['sot'] >= 2:
+                if total_xg >= 1.0 and rec['sot'] >= 1 and dom['sot'] >= 2 and curr_score == 1:
                     v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'iy_kg', dom_xg, curr_score)
                     if v >= self.MIN_VALUE_SCORE + 3:
                         picks.append(("İY KG VAR", 2.40, "Orta", v, "iy"))
