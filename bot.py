@@ -15,13 +15,13 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-GIST_ID = os.getenv("GIST_ID")
+TOKEN        = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID      = os.getenv("CHAT_ID")
+GIST_ID      = os.getenv("GIST_ID")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GROQ_KEY = os.getenv("GROQ_API_KEY")
+GROQ_KEY     = os.getenv("GROQ_API_KEY")
 
-brain = BettingBrain()
+brain     = BettingBrain()
 gist_lock = asyncio.Lock()
 
 HEADERS = {
@@ -32,14 +32,14 @@ HEADERS = {
 }
 GIST_HEADERS = {
     "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github.v3+json"
+    "Accept":        "application/vnd.github.v3+json"
 }
 
-LIVE_URL = "https://www.sofascore.com/api/v1/sport/football/events/live"
+LIVE_URL  = "https://www.sofascore.com/api/v1/sport/football/events/live"
 STATS_URL = "https://www.sofascore.com/api/v1/event/{}/statistics"
 MATCH_URL = "https://www.sofascore.com/api/v1/event/{}"
 
-last_ai_requests = []
+last_ai_requests  = []
 MAX_AI_PER_MINUTE = 20
 
 def safe_int(val, default=0):
@@ -98,10 +98,10 @@ async def fetch_api(url):
 
 def get_real_minute(m):
     try:
-        now = int(time.time())
+        now    = int(time.time())
         status = m.get("status") or {}
-        stype = (status.get("type") or "").lower()
-        desc = (status.get("description") or "").lower()
+        stype  = (status.get("type") or "").lower()
+        desc   = (status.get("description") or "").lower()
 
         if stype in ("finished", "ended"):
             return "MS"
@@ -179,14 +179,14 @@ async def get_stats(match_id):
     match_url = MATCH_URL.format(match_id)
 
     s = {
-        'home_sot': 0, 'away_sot': 0,
-        'home_shots': 0, 'away_shots': 0,
-        'home_corners': 0, 'away_corners': 0,
-        'home_poss': 50, 'away_poss': 50,
-        'home_xg': 0.0, 'away_xg': 0.0,
-        'home_attacks': 0, 'away_attacks': 0,
+        'home_sot': 0,       'away_sot': 0,
+        'home_shots': 0,     'away_shots': 0,
+        'home_corners': 0,   'away_corners': 0,
+        'home_poss': 50,     'away_poss': 50,
+        'home_xg': 0.0,      'away_xg': 0.0,
+        'home_attacks': 0,   'away_attacks': 0,
         'home_dangerous': 0, 'away_dangerous': 0,
-        'home_saves': 0, 'away_saves': 0,
+        'home_saves': 0,     'away_saves': 0,
         'home_big_chances': 0, 'away_big_chances': 0,
         'home_shots_box': 0, 'away_shots_box': 0,
         'has': False
@@ -211,7 +211,7 @@ async def get_stats(match_id):
                     continue
                 for g in p.get('groups', []):
                     for i in g.get('statisticsItems', []):
-                        n = i.get('name', '')
+                        n  = i.get('name', '')
                         hv = safe_int(i.get('homeValue', 0))
                         av = safe_int(i.get('awayValue', 0))
                         if n == 'Shots on target':
@@ -239,7 +239,7 @@ async def get_stats(match_id):
 
     try:
         if (not isinstance(match_resp, Exception) and match_resp.status_code == 200):
-            ev = match_resp.json().get('event', {})
+            ev      = match_resp.json().get('event', {})
             minute_str = get_real_minute(ev)
             s["minute_str"] = minute_str
             s["minute_int"] = safe_int(str(minute_str).replace("'", ""), 0)        
@@ -256,7 +256,7 @@ async def get_stats(match_id):
 
 def should_check_match(m, sent_ids):
     try:
-        mid = str(m.get('id', ''))
+        mid        = str(m.get('id', ''))
         minute_str = get_real_minute(m)
 
         if mid in sent_ids:
@@ -304,40 +304,26 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score, xg=0.
     h_danger = safe_int(stats.get("home_dangerous", 0))
     h_poss = safe_int(stats.get("home_poss", 50))
     
-    # Kısa ve öz prompt (Telegram için optimize)
+    # KISA ve ÖZ (max 90 karakter civarı)
     context = ""
     if "İY" in pick:
-        context = f"İlk yarı baskısı yüksek ({h_poss}%), {h_sot} isabetli şut."
-    elif "KG" in pick and "YOK" not in pick:
-        context = f"İki takım da açık oynuyor, toplam {h_sot + a_sot} şut."
-    elif "KG YOK" in pick:
-        context = f"Düşük tempolu, {h_sot + a_sot} şut."
+        context = f"İlk yarı baskısı %{h_poss}, {h_sot} isabetli şut."
+    elif "KG" in pick:
+        context = f"Karşılıklı ataklar: {h_sot}-{a_sot} isabetli şut."
     elif "Korner" in pick:
-        context = f"Kanat organizasyonları aktif, hücum baskısı yüksek."
-    elif "Handikap" in pick:
-        context = f"Baskı ve pozisyon üstünlüğü belirgin ({h_poss}%)."
+        context = f"Kanat organizasyonları aktif."
     else:
-        context = f"{h_sot} isabetli şut, baskı skoru {pressure}."
+        context = f"{h_sot} isabetli şut, baskı %{pressure}."
     
-    # Çok kısa prompt (max 2 cümle, toplam 40-50 kelime)
-    prompt = f"""Profesyonel spor analisti. 2 cümle, teknik dil.
-
-MAÇ: {home} vs {away} | {minute}' | {score}
-BAHİS: {pick}
-VERİ: {context} xG {xg}
-
-GÖREV:
-1. Oyun temposunu ve baskıyı rakamlarla özetle (max 12 kelime)
-2. Bahis mantığını kesin dille açıkla (max 15 kelime)
-Emoji yok. Kesin ifadeler kullan.
-
+    prompt = f"""Spor analisti. 2 kısa cümle, max 90 karakter.
+{context} Bahis: {pick}.
 Analiz:"""
 
     payload = {
         "model": "llama-3.1-8b-instant",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-        "max_tokens": 70  # Kısaltıldı (90'dan 70'e)
+        "temperature": 0.15,
+        "max_tokens": 60
     }
 
     for attempt in range(3):
@@ -353,14 +339,12 @@ Analiz:"""
                                .replace('[', '').replace(']', '').replace('"', '')
                                .replace("'", "").strip())
                     
-                    # Çok uzunsa kırp
-                    if len(clean) > 200:
-                        clean = clean[:197] + "..."
+                    if len(clean) > 95:
+                        clean = clean[:92] + "..."
                     
-                    if len(clean) < 15 or "cümle" in clean.lower():
+                    if len(clean) < 10:
                         return _fallback_comment(home, stats, pick, pressure, pick_type)
                     
-                    logger.info(f"AI → {clean[:60]}...")
                     return clean
                 elif r.status_code == 429:
                     await asyncio.sleep(6 * (attempt + 1))
@@ -375,39 +359,13 @@ Analiz:"""
 
 def _fallback_comment(home, stats, pick, pressure, pick_type="ust"):
     import random
-    
     h_sot = safe_int(stats.get('home_sot', 0))
-    a_sot = safe_int(stats.get('away_sot', 0))
-    h_danger = safe_int(stats.get('home_dangerous', 0))
-    
-    # Kısa fallback yorumları (max 100 karakter)
     templates = {
-        'iy': [
-            f"{h_sot} isabetli şutla baskı kuruluyor. Gol potansiyeli yüksek.",
-            f"İlk yarı temposu ve pozisyon üstünlüğü gol getirecek."
-        ],
-        'ms': [
-            f"Maçın ikinci yarısında {h_sot} şutla üstünlük devam ediyor.",
-            f"Baskı ve şut istatistikleri üst bahisini destekliyor."
-        ],
-        'kg': [
-            f"İki taraf da açık oynuyor, karşılıklı gol için zemin var.",
-            f"Defans zafiyetleri KG ihtimalini güçlendiriyor."
-        ],
-        'corner': [
-            f"Kanat organizasyonları korner üretiyor, trend devam edecek.",
-            f"Hücum baskısı korner sayısını artırmaya devam ediyor."
-        ],
-        'team': [
-            f"{h_sot} isabetli şutla takım baskısı sürdürüyor.",
-            f"Ofansif üstünlük 1.5 üstü için yeterli veri sunuyor."
-        ],
-        'default': [
-            f"{h_sot} isabetli şutla etkili baskı kuruluyor.",
-            f"İstatistiksel veriler {pick} lehine gelişiyor."
-        ]
+        'iy': [f"{h_sot} şutla baskı kuruluyor. Gol yakın.", f"İlk yarı temposu yüksek."],
+        'ms': [f"Baskı ve şut istatistikleri üst için uygun.", f"Maçın ikinci yarısında üstünlük devam ediyor."],
+        'kg': [f"İki taraf da açık oynuyor. KG potansiyeli var.", f"Karşılıklı ataklar mevcut."],
+        'default': [f"İstatistiksel veriler {pick} lehine.", f"Baskı skoru ({pressure}%) destekliyor."]
     }
-    
     category = pick_type if pick_type in templates else 'default'
     return random.choice(templates[category])
 
@@ -421,7 +379,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
     data = await fetch_api(LIVE_URL)
     events = data.get("events", [])
     if not events:
@@ -429,7 +386,6 @@ async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sem = asyncio.Semaphore(8)
-
     async def fetch_minute_for(mid: str):
         async with sem:
             r = await fetch_api(MATCH_URL.format(mid))
@@ -437,24 +393,17 @@ async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return get_real_minute(ev) if ev else None
 
     chosen = events[:20]
-    tasks = []
-    for m in chosen:
-        mid = str(m.get("id", ""))
-        tasks.append(fetch_minute_for(mid))
-
+    tasks = [fetch_minute_for(str(m.get("id", ""))) for m in chosen]
     minutes = await asyncio.gather(*tasks, return_exceptions=True)
 
     lines = ["⚽ <b>CANLI MAÇLAR</b>", ""]
     shown = 0
-
     for m, mn in zip(chosen, minutes):
         stype = (m.get("status", {}).get("type") or "").lower()
         if stype in ("finished", "ended", "notstarted", "scheduled"):
             continue
-
         if isinstance(mn, Exception) or not mn:
             mn = get_real_minute(m)
-
         if mn in ("İY", "MS", "0'"):
             continue
 
@@ -462,7 +411,6 @@ async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         a = html.escape(m.get("awayTeam", {}).get("name", "?") or "?")
         sh = safe_int(m.get("homeScore", {}).get("current", 0))
         sa = safe_int(m.get("awayScore", {}).get("current", 0))
-
         lines.append(f"⏱ <code>{mn}</code> | {h} <b>{sh}-{sa}</b> {a}")
         shown += 1
 
@@ -470,23 +418,13 @@ async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Şu an listelenecek canlı maç yok.")
         return
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True
-    )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔎 *Sistem Denetleniyor...*", parse_mode=ParseMode.MARKDOWN)
     api_data = await fetch_api(LIVE_URL)
     gist_data = await manage_history("read")
-    ai_test = await get_ai_insight(
-        "TestA", "TestB",
-        {'home_sot': 3, 'away_sot': 1, 'home_shots': 8, 'away_shots': 3, 'home_corners': 4, 'away_corners': 1,
-         'home_poss': 60, 'away_poss': 40, 'home_dangerous': 8, 'away_dangerous': 3,
-         'home_big_chances': 2, 'away_big_chances': 0},
-        "MS 1.5 ÜST", 70, 55, "1-0", 1.2, "ms"
-    )
+    ai_test = await get_ai_insight("TestA", "TestB", {'home_sot': 3, 'away_sot': 1, 'home_shots': 8, 'away_shots': 3}, "MS 1.5 ÜST", 70, 55, "1-0", 1.2, "ms")
     delivery = "✅ OK"
     try:
         await context.bot.send_message(chat_id=CHAT_ID, text="🧪 Test")
@@ -530,7 +468,6 @@ async def result_tracker(app):
                 logger.info("📊 Sonuçlar güncellendi.")
         except Exception as e:
             logger.error(f"Result tracker: {e}")
-
         await asyncio.sleep(600)
 
 async def signal_monitor(app):
@@ -576,27 +513,10 @@ async def signal_monitor(app):
                     momentum = res.get('momentum', 0)
                     pick_type = res.get('pick_type', 'ust')
 
-                    # Son mantık kontrolü (double check)
-                    h_s_check = safe_int(m.get('homeScore', {}).get('current', 0))
-                    a_s_check = safe_int(m.get('awayScore', {}).get('current', 0))
-                    total_goals = h_s_check + a_s_check
-                    pick_lower = res['pick'].lower()
-                    
-                    if '0.5 üst' in pick_lower and total_goals > 0:
-                        logger.warning(f"🚫 Mantık hatası engellendi: {pick_lower} ama skor {h_s_check}-{a_s_check}")
-                        continue
-                    if '1.5 üst' in pick_lower and total_goals > 1:
-                        logger.warning(f"🚫 Mantık hatası engellendi: {pick_lower} ama skor {h_s_check}-{a_s_check}")
-                        continue
-
                     logger.info(f"🔍 Sinyal: {home_name} vs {away_name} | {mn_int}' | {res['pick']}")
 
-                    ai_msg = await get_ai_insight(
-                        home_name, away_name, stats, res['pick'], 
-                        res['pressure'], mn_int, res['score'], xg_val, pick_type
-                    )
+                    ai_msg = await get_ai_insight(home_name, away_name, stats, res['pick'], res['pressure'], mn_int, res['score'], xg_val, pick_type)
 
-                    # Alternatifler (kompakt)
                     alt_picks = res.get('alt', [])
                     alt_txt = ""
                     if alt_picks:
@@ -606,33 +526,53 @@ async def signal_monitor(app):
                             odds = p[1]
                             risk = p[2]
                             risk_emoji = {"Düşük": "🟢", "Orta": "🟡", "Yüksek": "🔴", "Çok Düşük": "🟢"}.get(risk, "⚪")
-                            alt_lines.append(f"{risk_emoji} `{bet_name}` @{odds}")
+                            alt_lines.append(f"  {risk_emoji} `{bet_name}` @ {odds} ({risk})")
                         if alt_lines:
-                            alt_txt = "\n💡 *Alt:* " + " | ".join(alt_lines) + "\n"
+                            alt_txt = "\n💡 *ALTERNATİF STRATEJİLER*\n" + "\n".join(alt_lines) + "\n"
 
                     bar_val = max(0, min(100, res['pressure']))
                     bar = ("🟩" * (bar_val // 10) + "⬜" * (10 - bar_val // 10))
-                    conf_txt = " · ".join(res.get('confirmations', [])[:2])
+                    conf_txt = " · ".join(res.get('confirmations', [])[:3])
                     period_emoji = "1️⃣" if res['period'] == "1. YARI" else "2️⃣"
                     
                     h_xg = stats.get('home_xg', 0.0)
                     a_xg = stats.get('away_xg', 0.0)
-                    xg_str = f"{h_xg}-{a_xg}" if (h_xg > 0 or a_xg > 0) else str(xg_val)
+                    xg_line = f"`{h_xg} - {a_xg}` (Sofascore)" if (h_xg > 0 or a_xg > 0) else f"`{xg_val}` (tahmini)"
 
                     bet_emojis = {"iy": "⏱", "ms": "🏁", "kg": "⚽", "corner": "🚩", "team": "🎯", "handicap": "📊", "taraf": "🥅"}
                     bet_emoji = bet_emojis.get(pick_type, "🎯")
 
-                    # KOMPAKT MESAJ FORMATI
+                    # ESKİ GÜZEL FORMAT
                     txt = (
-                        f"📡 *SİNYAL* {bet_emoji} {time.strftime('%H:%M')}\n"
+                        f"📡 *SİNYAL* {bet_emoji} | {time.strftime('%H:%M')}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"⚽ *{home_name}* `{res['score']}` *{away_name}*\n"
-                        f"🏆 {league} | `{mn_int}'` {period_emoji}\n"
-                        f"🎯 *{res['pick']}* | Güven: {res['confidence']} `{res['prob']}%`\n"
-                        f"📊 S:{stats['home_sot']}-{stats['away_sot']} Ş:{stats['home_shots']}-{stats['away_shots']} "
-                        f"K:{stats['home_corners']}-{stats['away_corners']} P:{stats['home_poss']}%\n"
-                        f"🔥 Baskı: {bar} `{res['pressure']}%` | xG: `{xg_str}` | M: `{momentum}`\n"
-                        f"✅ {conf_txt}{alt_txt}"
-                        f"🧠 _{ai_msg}_"
+                        f"🏆 _{league}_\n"
+                        f"⏱ `{mn_int}'` {period_emoji} {res['period']}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🎯 *STRATEJİ:* `{res['pick']}`\n"
+                        f"📊 *Güven:* {res['confidence']} `{res['prob']}%`\n"
+                        f"⚠️ *Risk:* `{res['risk']}`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📈 *İSTATİSTİKLER*\n"
+                        f"┌ 🥅 İsabetli Şut: `{stats['home_sot']} - {stats['away_sot']}`\n"
+                        f"├ ⚡ Toplam Şut:   `{stats['home_shots']} - {stats['away_shots']}`\n"
+                        f"├ 🚩 Korner:      `{stats['home_corners']} - {stats['away_corners']}`\n"
+                        f"├ 🎮 Hakimiyet:   `%{stats['home_poss']} - %{stats['away_poss']}`\n"
+                        f"├ 🔥 Teh. Atak:   `{stats['home_dangerous']} - {stats['away_dangerous']}`\n"
+                        f"├ 💥 Büyük Fırsat: `{stats['home_big_chances']} - {stats['away_big_chances']}`\n"
+                        f"└ 🧤 Kurtarış:    `{stats['home_saves']} - {stats['away_saves']}`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔥 *BASKI:* {bar} `%{res['pressure']}`\n"
+                        f"📐 *xG:* {xg_line}\n"
+                        f"⚡ *Momentum:* `{momentum}`\n"
+                        f"👊 *Üstün:* {res['team']}\n"
+                        f"✅ _{conf_txt}_\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🧠 *ANALİZ:* _{ai_msg}_\n"
+                        f"{alt_txt}"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"💎 _VIP Pro Trader_"
                     )
 
                     await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
