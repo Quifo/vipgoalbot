@@ -322,8 +322,8 @@ Analiz:"""
     payload = {
         "model": "llama-3.1-8b-instant",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.15,
-        "max_tokens": 60
+        "temperature": 0.25,
+        "max_tokens": 100
     }
 
     for attempt in range(3):
