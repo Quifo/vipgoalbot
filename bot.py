@@ -299,31 +299,25 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score, xg=0.
     
     h_sot = safe_int(stats.get("home_sot", 0))
     a_sot = safe_int(stats.get("away_sot", 0))
-    h_shots = safe_int(stats.get("home_shots", 0))
-    a_shots = safe_int(stats.get("away_shots", 0))
     h_danger = safe_int(stats.get("home_dangerous", 0))
     h_poss = safe_int(stats.get("home_poss", 50))
     
-    # KISA ve ÖZ (max 90 karakter civarı)
-    context = ""
-    if "İY" in pick:
-        context = f"İlk yarı baskısı %{h_poss}, {h_sot} isabetli şut."
-    elif "KG" in pick:
-        context = f"Karşılıklı ataklar: {h_sot}-{a_sot} isabetli şut."
-    elif "Korner" in pick:
-        context = f"Kanat organizasyonları aktif."
-    else:
-        context = f"{h_sot} isabetli şut, baskı %{pressure}."
-    
-    prompt = f"""Spor analisti. 2 kısa cümle, max 90 karakter.
-{context} Bahis: {pick}.
-Analiz:"""
+    # Daha net ve uzun prompt (150 karakter için)
+    prompt = f"""Profesyonel spor analisti. 2 kısa cümle, maksimum 150 karakter.
+
+MAÇ: {home} vs {away} | {minute}' | {score}
+BAHİS: {pick}
+VERİ: {h_sot} isabetli şut, %{h_poss} baskı, {h_danger} tehlikeli atak.
+
+KURAL: Tam 2 cümle yaz. Kesin ve teknik dil kullan. Emoji kullanma.
+
+ANALİZ:"""
 
     payload = {
         "model": "llama-3.1-8b-instant",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.25,
-        "max_tokens": 100
+        "temperature": 0.2,
+        "max_tokens": 150  # 60'dan 150'ye çıkarıldı! (Yaklaşık 100-120 karakter)
     }
 
     for attempt in range(3):
@@ -339,12 +333,15 @@ Analiz:"""
                                .replace('[', '').replace(']', '').replace('"', '')
                                .replace("'", "").strip())
                     
-                    if len(clean) > 95:
-                        clean = clean[:92] + "..."
+                    # 150 karakteri geçerse kısalt ama ... ile bitir
+                    if len(clean) > 150:
+                        clean = clean[:147] + "..."
                     
-                    if len(clean) < 10:
+                    # Çok kısa olursa fallback kullan
+                    if len(clean) < 20:
                         return _fallback_comment(home, stats, pick, pressure, pick_type)
                     
+                    logger.info(f"AI → {clean[:80]}...")
                     return clean
                 elif r.status_code == 429:
                     await asyncio.sleep(6 * (attempt + 1))
