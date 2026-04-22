@@ -1,19 +1,19 @@
-# brain.py
+import time
 
 class BettingBrain:
     def __init__(self):
-        self.MIN_MINUTE        = 25
+        self.MIN_MINUTE        = 18      # Daha erken sinyal (25'ten 18'e)
         self.MAX_MINUTE        = 82
         self.MAX_TOTAL_GOALS   = 4
         self.MIN_TOTAL_SHOTS   = 10
         self.MIN_TOTAL_SOT     = 3
         self.MIN_SOT_RATIO     = 0.18
-        self.MIN_PRESSURE      = 50
+        self.MIN_PRESSURE      = 48      # Hafif düşürüldü (50'den)
         self.MIN_PRESSURE_DIFF = 12
-        self.MIN_ODDS          = 1.45
-        self.MIN_VALUE_SCORE   = 58
+        self.MIN_ODDS          = 1.40    # Hafif düşürüldü (1.45'ten)
+        self.MIN_VALUE_SCORE   = 55      # Hafif düşürüldü (58'den)
         self.MIN_CONFIRMATIONS = 3
-        self.MIN_XG_DOMINANT   = 0.8
+        self.MIN_XG_DOMINANT   = 0.75    # Hafif düşürüldü (0.8'den)
         self.MIN_XG_TOTAL      = 1.2
         self.MIN_MOMENTUM      = 55
 
@@ -58,8 +58,6 @@ class BettingBrain:
 
     # ─────────────────────────────────────────
     # xG HESAPLAMA
-    # Sofascore'dan geliyorsa onu kullan,
-    # yoksa istatistiklerden tahmin et
     # ─────────────────────────────────────────
     def _calculate_xg(self, sot, shots, corners, poss, minute,
                        real_xg=None):
@@ -119,7 +117,7 @@ class BettingBrain:
             return 0
 
     # ─────────────────────────────────────────
-    # TUTARSIZLIK DEDEKTÖRü
+    # TUTARSIZLIK DEDEKTÖRÜ
     # ─────────────────────────────────────────
     def _check_inconsistency(self, stats, dominant):
         try:
@@ -164,8 +162,10 @@ class BettingBrain:
                 issues.append("Fark çok açık")
             if diff <= -3:
                 issues.append("3+ gol geride")
-            if minute > 78 and (h_s + a_s) == 0 and 'ÜST' in str(pick):
+            if minute > 75 and (h_s + a_s) == 0 and 'ÜST' in str(pick):
                 issues.append("Geç dakika 0-0 ÜST riskli")
+            if minute > 70 and (h_s + a_s) == 0 and 'KG' in str(pick):
+                issues.append("70+ 0-0 KG riskli")
 
             return issues
         except:
@@ -213,10 +213,10 @@ class BettingBrain:
             return 0
 
     # ─────────────────────────────────────────
-    # DEĞER SKORU
+    # DEĞER SKORU (Genişletilmiş)
     # ─────────────────────────────────────────
     def _calc_value_score(self, pressure, sot, shots, corners,
-                           minute, bet_type, xg=0.0):
+                           minute, bet_type, xg=0.0, curr_score=0):
         try:
             pressure  = max(0, self._safe_int(pressure))
             sot       = max(0, self._safe_int(sot))
@@ -224,34 +224,32 @@ class BettingBrain:
             corners   = max(0, self._safe_int(corners))
             minute    = max(1, self._safe_int(minute, 1))
             xg        = max(0.0, self._safe_float(xg))
+            curr_score= max(0, self._safe_int(curr_score))
 
-            base     = pressure * 0.45
-            xg_bonus = min(xg * 15, 20)
+            base     = pressure * 0.40
+            xg_bonus = min(xg * 12, 18)
 
-            if bet_type in ['iy_ust', 'ms_ust_0', 'ms_ust_n']:
-                return min(100, int(
-                    base
-                    + min(sot     * 7,   28)
-                    + min(shots   * 1.8, 12)
-                    + min(corners * 1.2,  8)
-                    + (10 if 55 <= minute <= 75
-                       else 5 if 45 <= minute <= 80
-                       else 0)
-                    + xg_bonus
-                ))
-            elif bet_type == 'kg_var':
-                return min(100, int(
-                    base + min(sot * 6, 22) + xg_bonus
-                ))
-            elif bet_type == 'korner':
-                return min(100, int(
-                    base * 0.65
-                    + min(corners * 4.5, 30)
-                    + xg_bonus * 0.5
-                ))
-            elif bet_type == 'taraf':
-                return min(100, int(pressure * 0.85 + xg_bonus))
-            return 0
+            # Dakika bonusları
+            early_bonus = 15 if 25 <= minute <= 35 else 5 if 20 <= minute <= 40 else 0
+            late_bonus = 10 if 55 <= minute <= 70 else 5 if 45 <= minute <= 75 else 0
+
+            scores = {
+                'iy_ust': base + min(sot * 8, 30) + min(shots * 2, 10) + early_bonus + xg_bonus,
+                'iy_ust_15': base + min(sot * 9, 35) + min(shots * 2.5, 15) + (10 if 30 <= minute <= 40 else 0) + xg_bonus * 1.2,
+                'iy_kg': base + min(sot * 6, 20) + min(corners * 0.5, 5) + 10 + xg_bonus * 0.8,
+                'ms_25': base + min(sot * 7, 25) + min(shots * 1.5, 8) + late_bonus + xg_bonus,
+                'ms_35': base + min(sot * 8, 30) + min(shots * 2, 12) + (15 if curr_score >= 2 else 0) + xg_bonus * 1.3,
+                'ms_05': base + min(sot * 6, 20) + 5 + xg_bonus * 0.7,
+                'team_15': base + min(sot * 9, 35) + xg_bonus * 1.4,
+                'kg_var': base + min(sot * 6, 22) + 12 + xg_bonus,
+                'kg_yok': (100 - base) * 0.6 + min((10-sot) * 3, 20),
+                'korner_iy': base * 0.5 + min(corners * 4, 30) + 10,
+                'korner_ms': base * 0.4 + min(corners * 3.5, 25) + 8,
+                'handicap': base + min(sot * 8, 28) + xg_bonus * 1.2,
+                'taraf': base + min(sot * 7, 25) + xg_bonus,
+            }
+            
+            return min(100, int(scores.get(bet_type, base)))
         except:
             return 0
 
@@ -327,7 +325,6 @@ class BettingBrain:
                     f"Şut az "
                     f"(beklenen:{int(expected)}, olan:{total_shots})")
 
-            # Tehlikeli atak bonusu
             total_dangerous = (self._safe_get(stats, 'home_dangerous') +
                                 self._safe_get(stats, 'away_dangerous'))
             if total_dangerous >= 10:
@@ -335,7 +332,6 @@ class BettingBrain:
             elif total_dangerous > 0:
                 score += 5
 
-            # Büyük fırsat bonusu
             total_big = (self._safe_get(stats, 'home_big_chances') +
                          self._safe_get(stats, 'away_big_chances'))
             if total_big >= 2:
@@ -406,7 +402,7 @@ class BettingBrain:
             return False, None, 0, 0, 0, False, [f"Baskı hatası: {e}"]
 
     # ─────────────────────────────────────────
-    # AŞAMA 4: DEĞER ANALİZİ
+    # AŞAMA 4: DEĞER ANALİZİ (GENİŞLETİLMİŞ)
     # ─────────────────────────────────────────
     def _phase4_value_analysis(self, m, stats, minute,
                                 dominant, final_p, corner_support):
@@ -418,6 +414,8 @@ class BettingBrain:
                     'shots':   self._safe_get(stats, 'home_shots'),
                     'corners': self._safe_get(stats, 'home_corners'),
                     'poss':    self._safe_get(stats, 'home_poss', 50),
+                    'dangerous': self._safe_get(stats, 'home_dangerous'),
+                    'big_chances': self._safe_get(stats, 'home_big_chances'),
                 }
                 rec = {
                     'sot':     self._safe_get(stats, 'away_sot'),
@@ -425,14 +423,15 @@ class BettingBrain:
                     'corners': self._safe_get(stats, 'away_corners'),
                     'poss':    self._safe_get(stats, 'away_poss', 50),
                 }
-                real_xg = self._safe_float(
-                    stats.get('home_xg', None), None)
-            elif dominant == 'away':
+                real_xg = self._safe_float(stats.get('home_xg', None), None)
+            else:
                 dom = {
                     'sot':     self._safe_get(stats, 'away_sot'),
                     'shots':   self._safe_get(stats, 'away_shots'),
                     'corners': self._safe_get(stats, 'away_corners'),
                     'poss':    self._safe_get(stats, 'away_poss', 50),
+                    'dangerous': self._safe_get(stats, 'away_dangerous'),
+                    'big_chances': self._safe_get(stats, 'away_big_chances'),
                 }
                 rec = {
                     'sot':     self._safe_get(stats, 'home_sot'),
@@ -440,98 +439,172 @@ class BettingBrain:
                     'corners': self._safe_get(stats, 'home_corners'),
                     'poss':    self._safe_get(stats, 'home_poss', 50),
                 }
-                real_xg = self._safe_float(
-                    stats.get('away_xg', None), None)
-            else:
-                return default_return
+                real_xg = self._safe_float(stats.get('away_xg', None), None)
 
             h_s        = self._safe_get_team(m, 'home', 'current')
             a_s        = self._safe_get_team(m, 'away', 'current')
             curr_score = h_s + a_s
             minute     = max(1, self._safe_int(minute, 1))
             period     = "1. YARI" if minute <= 45 else "2. YARI"
-
-            dom_xg   = self._calculate_xg(
-                dom['sot'], dom['shots'],
-                dom['corners'], dom['poss'],
-                minute, real_xg
-            )
-            rec_xg   = self._calculate_xg(
-                rec['sot'], rec['shots'],
-                rec['corners'], rec['poss'], minute
-            )
+            
+            dom_xg   = self._calculate_xg(dom['sot'], dom['shots'], dom['corners'], dom['poss'], minute, real_xg)
+            rec_xg   = self._calculate_xg(rec['sot'], rec['shots'], rec['corners'], rec['poss'], minute)
             total_xg = round(dom_xg + rec_xg, 2)
-
+            
             picks = []
+            total_c = (self._safe_get(stats, 'home_corners') + self._safe_get(stats, 'away_corners'))
 
-            # ÜST BAHİSLERİ
-            if dom_xg >= self.MIN_XG_DOMINANT:
-                if minute <= 42:
-                    if curr_score == 0 and dom['sot'] >= 2:
-                        v = self._calc_value_score(
-                            final_p, dom['sot'], dom['shots'],
-                            dom['corners'], minute, 'iy_ust', dom_xg)
-                        if v >= self.MIN_VALUE_SCORE:
-                            picks.append(
-                                ("İY 0.5 ÜST", 1.60, "Düşük", v))
-                else:
-                    if curr_score == 0 and dom['sot'] >= 3:
-                        v = self._calc_value_score(
-                            final_p, dom['sot'], dom['shots'],
-                            dom['corners'], minute, 'ms_ust_0', dom_xg)
-                        if v >= self.MIN_VALUE_SCORE:
-                            picks.append(
-                                ("MS 0.5 ÜST", 1.55, "Düşük", v))
-                    elif curr_score >= 1 and dom['sot'] >= 2:
-                        v = self._calc_value_score(
-                            final_p, dom['sot'], dom['shots'],
-                            dom['corners'], minute, 'ms_ust_n', dom_xg)
-                        if v >= self.MIN_VALUE_SCORE:
-                            picks.append((
-                                f"MS {curr_score + 0.5} ÜST",
-                                1.55, "Düşük", v))
-
-            # KG VAR
-            if total_xg >= self.MIN_XG_TOTAL:
-                kg_min = 2 if minute > 60 else 3
-                if dom['sot'] >= kg_min and rec['sot'] >= 2:
-                    v = self._calc_value_score(
-                        final_p, dom['sot'], dom['shots'],
-                        dom['corners'], minute, 'kg_var', dom_xg)
-                    if v >= self.MIN_VALUE_SCORE + 8:
-                        odds = 1.75 if curr_score == 0 else 1.65
-                        picks.append(("KG VAR", odds, "Orta", v))
-
-            # KORNER
-            total_c = (self._safe_get(stats, 'home_corners') +
-                       self._safe_get(stats, 'away_corners'))
-            if minute > 52 and total_c >= 8 and corner_support:
-                if (total_c / minute) >= 0.13:
-                    v = self._calc_value_score(
-                        final_p, dom['sot'], dom['shots'],
-                        dom['corners'], minute, 'korner', dom_xg)
+            # ═══════════════════════════════════════
+            # 1. İLK YARI BAHİSLERİ (Dakika <= 40)
+            # ═══════════════════════════════════════
+            if minute <= 40 and curr_score <= 1:
+                # İY 0.5 ÜST
+                if dom['sot'] >= 2 and dom_xg >= 0.4:
+                    v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'iy_ust', dom_xg, curr_score)
                     if v >= self.MIN_VALUE_SCORE:
-                        picks.append((
-                            f"Korner {total_c + 1.5} ÜST",
-                            1.65, "Orta", v))
+                        picks.append(("İY 0.5 ÜST", 1.70, "Düşük", v, "iy"))
+                
+                # İY 1.5 ÜST (Agresif)
+                if dom['sot'] >= 3 and dom['shots'] >= 7 and dom_xg >= 0.7 and curr_score == 0:
+                    v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'iy_ust_15', dom_xg, curr_score)
+                    if v >= self.MIN_VALUE_SCORE + 5:
+                        picks.append(("İY 1.5 ÜST", 2.20, "Orta", v, "iy"))
+                
+                # İY KG VAR
+                if total_xg >= 1.0 and rec['sot'] >= 1 and dom['sot'] >= 2:
+                    v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'iy_kg', dom_xg, curr_score)
+                    if v >= self.MIN_VALUE_SCORE + 3:
+                        picks.append(("İY KG VAR", 2.40, "Orta", v, "iy"))
 
-            # TARAF
-            if final_p >= 72 and minute > 55:
+            # ═══════════════════════════════════════
+            # 2. MAÇ SONU BAHİSLERİ (Dakika >= 50)
+            # ═══════════════════════════════════════
+            if minute >= 50:
+                # MS 2.5 ÜST
+                if total_xg >= 1.8 and curr_score >= 1 and dom['sot'] >= 2:
+                    v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'ms_25', dom_xg, curr_score)
+                    if v >= self.MIN_VALUE_SCORE:
+                        picks.append(("MS 2.5 ÜST", 1.90, "Orta", v, "ms"))
+                
+                # MS 3.5 ÜST
+                if total_xg >= 2.4 and curr_score >= 2 and (dom['sot'] + rec['sot']) >= 5:
+                    v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'ms_35', dom_xg, curr_score)
+                    if v >= self.MIN_VALUE_SCORE + 8:
+                        picks.append(("MS 3.5 ÜST", 2.60, "Yüksek", v, "ms"))
+
+                # MS 0.5 ÜST (Güvenli)
+                if curr_score == 0 and dom['sot'] >= 3 and minute < 75:
+                    v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'ms_05', dom_xg, curr_score)
+                    if v >= self.MIN_VALUE_SCORE:
+                        picks.append(("MS 0.5 ÜST", 1.35, "Çok Düşük", v, "ms"))
+
+            # ═══════════════════════════════════════
+            # 3. TAKIM BAZLI GOL BAHİSLERİ
+            # ═══════════════════════════════════════
+            if minute >= 60 and dom['sot'] >= 4 and dom_xg >= 1.2:
+                team_code = "1" if dominant == 'home' else "2"
+                v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'team_15', dom_xg, curr_score)
+                if v >= self.MIN_VALUE_SCORE + 5:
+                    picks.append((f"{team_code}T 1.5 ÜST", 2.10, "Orta", v, "team"))
+
+            # ═══════════════════════════════════════
+            # 4. KG VAR / YOK
+            # ═══════════════════════════════════════
+            if total_xg >= 1.6 and rec['sot'] >= 2 and dom['sot'] >= 2:
+                if not (minute > 75 and curr_score == 0):
+                    v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'kg_var', dom_xg, curr_score)
+                    if v >= self.MIN_VALUE_SCORE + 5:
+                        picks.append(("KG VAR", 1.85, "Orta", v, "kg"))
+
+            # KG YOK (Defansif)
+            if curr_score == 0 and minute > 60 and total_xg < 0.8 and dom['sot'] <= 2 and rec['sot'] <= 1:
+                v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'kg_yok', dom_xg, curr_score)
+                if v >= self.MIN_VALUE_SCORE + 10:
+                    picks.append(("KG YOK", 2.80, "Yüksek", v, "kg"))
+
+            # ═══════════════════════════════════════
+            # 5. KORNER BAHİSLERİ
+            # ═══════════════════════════════════════
+            if minute > 50:
+                corner_ratio = total_c / minute if minute > 0 else 0
+                
+                if minute <= 55 and total_c >= 6:
+                    v = self._calc_value_score(final_p, dom['sot'], dom['shots'], total_c, minute, 'korner_iy', dom_xg, curr_score)
+                    if v >= self.MIN_VALUE_SCORE:
+                        picks.append((f"İY Korner {total_c + 2.5} ÜST", 1.90, "Düşük", v, "corner"))
+                
+                if corner_ratio >= 0.22:
+                    target = 10.5 if total_c >= 8 else 9.5
+                    if total_c >= 10:
+                        target = 11.5
+                    v = self._calc_value_score(final_p, dom['sot'], dom['shots'], total_c, minute, 'korner_ms', dom_xg, curr_score)
+                    if v >= self.MIN_VALUE_SCORE:
+                        picks.append((f"Korner {target} ÜST", 1.85, "Orta", v, "corner"))
+
+            # ═══════════════════════════════════════
+            # 6. HANDIKAP / TARAF
+            # ═══════════════════════════════════════
+            if final_p >= 68 and minute > 60:
                 dom_score = h_s if dominant == 'home' else a_s
                 rec_score = a_s if dominant == 'home' else h_s
-                if dom_score <= rec_score:
-                    v = self._calc_value_score(
-                        final_p, dom['sot'], dom['shots'],
-                        dom['corners'], minute, 'taraf', dom_xg)
+                
+                if dom_score > rec_score and (dom_score - rec_score) == 1:
+                    if dom['sot'] >= 4 and dom['poss'] >= 55:
+                        v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'handicap', dom_xg, curr_score)
+                        if v >= self.MIN_VALUE_SCORE + 8:
+                            picks.append((f"Handikap -1 ({self._safe_team_name(m, dominant)})", 2.40, "Yüksek", v, "handicap"))
+                
+                if dom_score == rec_score and dom['sot'] >= 5:
+                    team_code = "1" if dominant == 'home' else "2"
+                    v = self._calc_value_score(final_p, dom['sot'], dom['shots'], dom['corners'], minute, 'taraf', dom_xg, curr_score)
                     if v >= self.MIN_VALUE_SCORE + 5:
-                        label = ("MS 1Ç" if dominant == 'home'
-                                 else "MS 2Ç")
-                        picks.append((label, 1.55, "Orta", v))
+                        picks.append((f"MS {team_code}", 2.00, "Orta", v, "taraf"))
 
             return picks, period, curr_score, dom_xg, rec_xg, total_xg
 
         except Exception as e:
             return default_return
+
+    # ─────────────────────────────────────────
+    # ALTERNATİF SEÇİM SİSTEMİ
+    # ─────────────────────────────────────────
+    def _select_alternatives(self, picks, main_pick, stats, minute):
+        """Ana bahise göre hedge ve çeşitlendirme önerileri"""
+        if not picks or len(picks) <= 1:
+            return []
+        
+        main_type = main_pick[4] if len(main_pick) > 4 else "unknown"
+        alternatives = []
+        
+        for pick in picks:
+            if pick[0] == main_pick[0]:
+                continue
+            
+            pick_type = pick[4] if len(pick) > 4 else "unknown"
+            
+            # Hedge mantığı
+            if main_type == "iy" and pick_type == "ms":
+                alternatives.append(pick)
+            elif main_type == "kg" and pick_type in ["ms", "iy"]:
+                alternatives.append(pick)
+            elif main_type in ["ms", "iy"] and pick_type in ["kg", "corner"]:
+                alternatives.append(pick)
+            elif main_type == "team" and pick_type in ["kg", "ms"]:
+                alternatives.append(pick)
+            elif pick[2] == "Düşük" and main_pick[2] != "Düşük":
+                alternatives.append(pick)
+        
+        # En fazla 2 alternatif, farklı risk seviyelerinde
+        final_alts = []
+        seen_types = set()
+        
+        for alt in sorted(alternatives, key=lambda x: x[3], reverse=True):
+            alt_type = alt[4] if len(alt) > 4 else "unknown"
+            if alt_type not in seen_types and len(final_alts) < 2:
+                final_alts.append(alt)
+                seen_types.add(alt_type)
+        
+        return final_alts
 
     # ─────────────────────────────────────────
     # AŞAMA 5: ÇAPRAZ DOĞRULAMA
@@ -616,8 +689,7 @@ class BettingBrain:
 
             # 8. Tehlikeli atak
             if dom_dangerous > rec_dangerous and dom_dangerous >= 5:
-                confirmations.append(
-                    f"tehlikeli atak üstünlüğü ({dom_dangerous})")
+                confirmations.append(f"tehlikeli atak üstünlüğü ({dom_dangerous})")
             elif dom_dangerous > 0:
                 denials.append("tehlikeli atak yetersiz")
 
@@ -629,8 +701,7 @@ class BettingBrain:
 
             # 10. Kaleci baskısı
             if dom_saves >= 3:
-                confirmations.append(
-                    f"rakip kaleci zorlanıyor ({dom_saves})")
+                confirmations.append(f"rakip kaleci zorlanıyor ({dom_saves})")
 
             return (len(confirmations) >= self.MIN_CONFIRMATIONS,
                     confirmations, denials)
@@ -679,7 +750,7 @@ class BettingBrain:
             return 60, "📊 ORTA"
 
     # ─────────────────────────────────────────
-    # ANA FONKSİYON
+    # ANA FONKSİYON (Genişletilmiş)
     # ─────────────────────────────────────────
     def analyze_advanced(self, m, stats, minute, odds_drop=0):
         try:
@@ -737,6 +808,9 @@ class BettingBrain:
                 return {"is_signal": False,
                         "reason": f"[A5] {', '.join(denials[:2])}"}
 
+            # Alternatif seçim
+            alt_picks = self._select_alternatives(picks, best, stats, minute)
+
             total_c = (self._safe_get(stats, 'home_corners') +
                        self._safe_get(stats, 'away_corners'))
             target  = self._safe_team_name(m, dominant)
@@ -749,10 +823,11 @@ class BettingBrain:
                 "pressure":      final_p,
                 "period":        period,
                 "pick":          best[0],
+                "pick_type":     best[4] if len(best) > 4 else "unknown",
                 "confidence":    conf,
                 "risk":          best[2],
                 "prob":          prob,
-                "alt":           [(p[0], p[1], p[2]) for p in picks],
+                "alt":           [(p[0], p[1], p[2], p[4]) for p in alt_picks],
                 "score":         f"{h_s}-{a_s}",
                 "total_score":   curr_score,
                 "confirmations": confirmations,
