@@ -1,4 +1,4 @@
-import os, asyncio, httpx, json, time, logging
+import os, asyncio, json, time, logging
 import html
 from telegram.constants import ChatAction
 from telegram import Update
@@ -6,6 +6,14 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 from brain import BettingBrain
 from dotenv import load_dotenv
+
+# YENİ: curl_cffi import (Sofascore için)
+try:
+    from curl_cffi import requests as curl_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
+    curl_requests = None
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -21,18 +29,21 @@ GIST_ID      = os.getenv("GIST_ID")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GROQ_KEY     = os.getenv("GROQ_API_KEY")
 
+# GIST_HEADERS en üste alındı (hata önlemi)
+GIST_HEADERS = {
+    "Authorization": f"token {GITHUB_TOKEN}",
+    "Accept":        "application/vnd.github.v3+json"
+}
+
 brain     = BettingBrain()
 gist_lock = asyncio.Lock()
 
+# Normal headers (httpx için fallback)
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36"
     )
-}
-GIST_HEADERS = {
-    "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept":        "application/vnd.github.v3+json"
 }
 
 LIVE_URL  = "https://www.sofascore.com/api/v1/sport/football/events/live"
@@ -83,18 +94,42 @@ def minute_str_to_int(minute_str: str) -> int:
     except:
         return 0        
 
+# YENİ: curl_cffi ile fetch (Sofascore banını aşar)
 async def fetch_api(url):
-    async with httpx.AsyncClient(
-        timeout=30.0, follow_redirects=True, headers=HEADERS
-    ) as client:
-        try:
-            r = await client.get(url)
-            if r.status_code == 200:
-                return r.json()
+    if not CURL_CFFI_AVAILABLE:
+        logger.error("curl_cffi kurulu değil! pip install curl_cffi")
+        # Fallback: httpx dene
+        import httpx
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=HEADERS) as client:
+            try:
+                r = await client.get(url)
+                return r.json() if r.status_code == 200 else {}
+            except Exception as e:
+                logger.error(f"API Hatası: {e}")
+                return {}
+    
+    try:
+        loop = asyncio.get_event_loop()
+        # curl_cffi synchronous çalışır, thread'e atıyoruz
+        response = await loop.run_in_executor(
+            None, 
+            lambda: curl_requests.get(
+                url, 
+                headers={"Accept": "application/json", "Accept-Language": "en-US,en;q=0.9"},
+                impersonate="chrome120",  # Chrome 120 taklidi
+                timeout=30
+            )
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logger.error(f"HTTP {response.status_code}: {url}")
             return {}
-        except Exception as e:
-            logger.error(f"API Hatası ({url}): {e}")
-            return {}
+            
+    except Exception as e:
+        logger.error(f"curl_cffi hatası ({url}): {e}")
+        return {}
 
 def get_real_minute(m):
     try:
@@ -192,21 +227,16 @@ async def get_stats(match_id):
         'has': False
     }
 
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=HEADERS) as client:
-        try:
-            stats_resp, match_resp = await asyncio.gather(
-                client.get(stats_url),
-                client.get(match_url),
-                return_exceptions=True
-            )
-        except Exception as e:
-            logger.error(f"Paralel istek hatası ({match_id}): {e}")
-            return None
+    # Paralel istek (curl_cffi artık fetch_api içinde)
+    stats_resp, match_resp = await asyncio.gather(
+        fetch_api(stats_url),
+        fetch_api(match_url),
+        return_exceptions=True
+    )
 
     try:
-        if (not isinstance(stats_resp, Exception) and stats_resp.status_code == 200):
-            data = stats_resp.json()
-            for p in data.get('statistics', []):
+        if isinstance(stats_resp, dict) and stats_resp:
+            for p in stats_resp.get('statistics', []):
                 if p.get('period') != 'ALL':
                     continue
                 for g in p.get('groups', []):
@@ -238,8 +268,8 @@ async def get_stats(match_id):
         logger.error(f"Stats parse ({match_id}): {e}")
 
     try:
-        if (not isinstance(match_resp, Exception) and match_resp.status_code == 200):
-            ev      = match_resp.json().get('event', {})
+        if isinstance(match_resp, dict) and match_resp:
+            ev      = match_resp.get('event', {})
             minute_str = get_real_minute(ev)
             s["minute_str"] = minute_str
             s["minute_int"] = safe_int(str(minute_str).replace("'", ""), 0)        
@@ -302,26 +332,22 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score, xg=0.
     h_danger = safe_int(stats.get("home_dangerous", 0))
     h_poss = safe_int(stats.get("home_poss", 50))
     
-    # Daha net ve uzun prompt (150 karakter için)
-    prompt = f"""Profesyonel spor analisti. 2 kısa cümle, maksimum 150 karakter.
-
-MAÇ: {home} vs {away} | {minute}' | {score}
-BAHİS: {pick}
-VERİ: {h_sot} isabetli şut, %{h_poss} baskı, {h_danger} tehlikeli atak.
-
-KURAL: Tam 2 cümle yaz. Kesin ve teknik dil kullan. Emoji kullanma.
-
-ANALİZ:"""
+    # Kısa ve öz prompt (Telegram için optimize)
+    prompt = f"""Profesyonel spor analisti. 2 kısa cümle, max 90 karakter.
+{home} vs {away} | {minute}' | {score} | Bahis: {pick}
+Veri: {h_sot} isabetli şut, %{h_poss} baskı.
+Analiz:"""
 
     payload = {
         "model": "llama-3.1-8b-instant",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
-        "max_tokens": 300
+        "max_tokens": 100
     }
 
     for attempt in range(3):
         try:
+            import httpx
             async with httpx.AsyncClient(timeout=15.0) as client:
                 r = await client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
@@ -333,15 +359,13 @@ ANALİZ:"""
                                .replace('[', '').replace(']', '').replace('"', '')
                                .replace("'", "").strip())
                     
-                    # 150 karakteri geçerse kısalt ama ... ile bitir
-                    if len(clean) > 150:
-                        clean = clean[:147] + "..."
+                    # Çok uzunsa kırp
+                    if len(clean) > 95:
+                        clean = clean[:92] + "..."
                     
-                    # Çok kısa olursa fallback kullan
-                    if len(clean) < 20:
+                    if len(clean) < 15:
                         return _fallback_comment(home, stats, pick, pressure, pick_type)
                     
-                    logger.info(f"AI → {clean[:80]}...")
                     return clean
                 elif r.status_code == 429:
                     await asyncio.sleep(6 * (attempt + 1))
@@ -358,9 +382,9 @@ def _fallback_comment(home, stats, pick, pressure, pick_type="ust"):
     import random
     h_sot = safe_int(stats.get('home_sot', 0))
     templates = {
-        'iy': [f"{h_sot} şutla baskı kuruluyor. Gol yakın.", f"İlk yarı temposu yüksek."],
-        'ms': [f"Baskı ve şut istatistikleri üst için uygun.", f"Maçın ikinci yarısında üstünlük devam ediyor."],
-        'kg': [f"İki taraf da açık oynuyor. KG potansiyeli var.", f"Karşılıklı ataklar mevcut."],
+        'iy': [f"{h_sot} isabetli şutla baskı kuruluyor. Gol yakın.", f"İlk yarı temposu yüksek."],
+        'ms': [f"Maçın ikinci yarısında baskı sürüyor. Gol potansiyeli var.", f"İstatistikler üst bahisini destekliyor."],
+        'kg': [f"İki taraf da açık oynuyor. Karşılıklı gol olabilir.", f"Defans zafiyetleri KG ihtimalini artırıyor."],
         'default': [f"İstatistiksel veriler {pick} lehine.", f"Baskı skoru ({pressure}%) destekliyor."]
     }
     category = pick_type if pick_type in templates else 'default'
@@ -368,7 +392,7 @@ def _fallback_comment(home, stats, pick, pressure, pick_type="ust"):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *VIP Pro Trader Bot Aktif!*\n\n"
+        "🤖 *VIP Pro Trader Bot Aktif! (curl_cffi modu)*\n\n"
         "/canli - Canlı maçları listeler\n"
         "/kontrol - Sistem denetimi yapar",
         parse_mode=ParseMode.MARKDOWN
@@ -419,24 +443,28 @@ async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔎 *Sistem Denetleniyor...*", parse_mode=ParseMode.MARKDOWN)
+    
+    start_time = time.time()
     api_data = await fetch_api(LIVE_URL)
+    elapsed = time.time() - start_time
+    
+    events = api_data.get("events", []) if api_data else []
     gist_data = await manage_history("read")
-    ai_test = await get_ai_insight("TestA", "TestB", {'home_sot': 3, 'away_sot': 1, 'home_shots': 8, 'away_shots': 3}, "MS 1.5 ÜST", 70, 55, "1-0", 1.2, "ms")
-    delivery = "✅ OK"
-    try:
-        await context.bot.send_message(chat_id=CHAT_ID, text="🧪 Test")
-    except:
-        delivery = "❌ HATA"
+    
+    # Test AI
+    ai_test = "Test"  # Basitleştirildi
+    
+    curl_status = "✅ Aktif" if CURL_CFFI_AVAILABLE else "❌ Yok"
 
     report = (
         f"🛡 *BOT DENETİM RAPORU*\n\n"
-        f"🌐 API: {'✅ OK' if api_data else '❌ HATA'}\n"
+        f"🔧 curl_cffi: {curl_status}\n"
+        f"⏱️ Yanıt Süresi: {elapsed:.2f}s\n"
+        f"🌐 Sofascore API: {'✅ OK' if events else '❌ HATA'}\n"
         f"💾 Gist: {'✅ OK' if isinstance(gist_data, list) else '❌ HATA'}\n"
-        f"🧠 AI: {'✅ OK' if len(ai_test) > 10 else '❌ HATA'}\n"
-        f"📩 İletim: {delivery}\n"
-        f"⚽ Canlı Maç: {len(api_data.get('events', []))}\n"
+        f"⚽ Canlı Maç: {len(events)}\n"
         f"📊 Kayıtlı Sinyal: {len(gist_data) if isinstance(gist_data, list) else 0}\n\n"
-        f"🚀 _Sistem aktif!_"
+        f"🚀 _curl_cffi modu aktif!_"
     )
     await msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
 
@@ -451,7 +479,7 @@ async def result_tracker(app):
             for sig in history[-20:]:
                 if (sig.get('status') == 'pending' and time.time() - sig.get('timestamp', 0) > 3600):
                     r = await fetch_api(f"https://www.sofascore.com/api/v1/event/{sig['id']}")
-                    ev = r.get('event', {})
+                    ev = r.get('event', {}) if r else {}
                     if ev.get('status', {}).get('type') == 'finished':
                         hs = safe_int(ev.get('homeScore', {}).get('current', 0))
                         as_ = safe_int(ev.get('awayScore', {}).get('current', 0))
@@ -523,7 +551,6 @@ async def signal_monitor(app):
                     if alt_picks:
                         alt_lines = []
                         for p in alt_picks[:2]:
-                            # p = (name, odds, risk, type)
                             bet_name = p[0]
                             alt_lines.append(f"  - {bet_name}")
                         if alt_lines:
@@ -531,7 +558,6 @@ async def signal_monitor(app):
 
                     period_emoji = "2️⃣" if res['period'] == "2. YARI" else "1️⃣"
                     
-                    # İstatistikleri hazırla
                     h_sot = stats.get('home_sot', 0)
                     a_sot = stats.get('away_sot', 0)
                     h_shots = stats.get('home_shots', 0)
@@ -545,11 +571,10 @@ async def signal_monitor(app):
                     h_saves = stats.get('home_saves', 0)
                     a_saves = stats.get('away_saves', 0)
 
-                    # YENİ FORMAT
                     txt = (
                         f"📡 *SİNYAL*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"⚽️ *{home_name}* {res['score']} *{away_name}*\n"
+                        f"⚽️ *{home_name}* `{res['score']}` *{away_name}*\n"
                         f"🏆 _{league}_\n"
                         f"⏱️ `{mn_int}'` {period_emoji} {res['period']}\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -565,6 +590,9 @@ async def signal_monitor(app):
                         f"├ 🎮 Hakimiyet:   `%{h_poss} - %{a_poss}`\n"
                         f"├ 💥 Büyük Fırsat: `{h_big} - {a_big}`\n"
                         f"└ 🧤 Kurtarış:    `{h_saves} - {a_saves}`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔥 *BASKI:* `%{res['pressure']}` | xG: `{xg_val}` | M: `{momentum}`\n"
+                        f"✅ _{' · '.join(res['confirmations'][:2])}_\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🧠 *ANALİZ:* _{ai_msg}_\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -620,9 +648,12 @@ if __name__ == "__main__":
     )
 
     app.add_error_handler(error_handler)
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("canli", live_command))
+    app.add_handler(CommandHandler("start",   start_command))
+    app.add_handler(CommandHandler("canli",   live_command))
     app.add_handler(CommandHandler("kontrol", control_command))
 
     logger.info("✅ Bot hazır!")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    )
