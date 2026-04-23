@@ -4,18 +4,18 @@ class BettingBrain:
     def __init__(self):
         # KATILAŞTIRILMIŞ DEĞERLER
         self.MIN_MINUTE        = 18
-        self.MAX_MINUTE        = 82
+        self.MAX_MINUTE        = 85
         self.MAX_TOTAL_GOALS   = 4
         self.MIN_TOTAL_SHOTS   = 6
         self.MIN_TOTAL_SOT     = 2
-        self.MIN_SOT_RATIO     = 0.18
+        self.MIN_SOT_RATIO     = 0.16
         self.MIN_PRESSURE      = 50
-        self.MIN_PRESSURE_DIFF = 12
-        self.MIN_ODDS          = 1.45
-        self.MIN_VALUE_SCORE   = 58
+        self.MIN_PRESSURE_DIFF = 10
+        self.MIN_ODDS          = 1.40
+        self.MIN_VALUE_SCORE   = 55
         self.MIN_CONFIRMATIONS = 3
-        self.MIN_XG_DOMINANT   = 0.8
-        self.MIN_XG_TOTAL      = 1.2
+        self.MIN_XG_DOMINANT   = 0.60
+        self.MIN_XG_TOTAL      = 1.0
         self.MIN_MOMENTUM      = 55
 
     def _safe_int(self, val, default=0):
