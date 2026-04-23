@@ -1,5 +1,6 @@
-import os, asyncio, httpx, json, time, logging
+import os, asyncio, httpx, json, time, logging, random
 import html
+from datetime import datetime
 from telegram.constants import ChatAction
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -24,38 +25,31 @@ GROQ_KEY     = os.getenv("GROQ_API_KEY")
 brain     = BettingBrain()
 gist_lock = asyncio.Lock()
 
+# Fotmob Headers (Daha hafif koruma)
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.sofascore.com/",
-    "Origin": "https://www.sofascore.com",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "Connection": "keep-alive",
-    "Cache-Control": "max-age=0",
-    "DNT": "1"
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.fotmob.com/",
+    "Origin": "https://www.fotmob.com",
+    "X-Requested-With": "XMLHttpRequest"
 }
+
 GIST_HEADERS = {
     "Authorization": f"token {GITHUB_TOKEN}",
     "Accept":        "application/vnd.github.v3+json"
 }
 
-LIVE_URL  = "https://www.sofascore.com/api/v1/sport/football/events/live"
-STATS_URL = "https://www.sofascore.com/api/v1/event/{}/statistics"
-MATCH_URL = "https://www.sofascore.com/api/v1/event/{}"
+# Fotmob API URL'leri
+LIVE_URL  = "https://www.fotmob.com/api/live"
+MATCH_URL = "https://www.fotmob.com/api/matchDetails?matchId={}"
 
 last_ai_requests  = []
 MAX_AI_PER_MINUTE = 20
 
 def safe_int(val, default=0):
     try:
-        if val is None or val == '' or val == '-':
+        if val is None or val == '' or val == '-' or val == 'None':
             return default
         return int(float(str(val).replace('%', '').strip()))
     except:
@@ -63,7 +57,7 @@ def safe_int(val, default=0):
 
 def safe_float(val, default=0.0):
     try:
-        if val is None or val == '' or val == '-':
+        if val is None or val == '' or val == '-' or val == 'None':
             return default
         return float(str(val).replace('%', '').strip())
     except:
@@ -79,92 +73,207 @@ def normalize_ts(ts):
         return ts
     except:
         return None        
-        
-def minute_str_to_int(minute_str: str) -> int:
-    try:
-        if not minute_str:
-            return 0
-        s = minute_str.replace("'", "").strip()
-        if s in ("İY", "MS", "0"):
-            return 0
-        if "+" in s:
-            a, b = s.split("+", 1)
-            return safe_int(a, 0) + safe_int(b, 0)
-        return safe_int(s, 0)
-    except:
-        return 0        
 
-async def fetch_api(url):
-    async with httpx.AsyncClient(
-        timeout=30.0, follow_redirects=True, headers=HEADERS
-    ) as client:
+async def fetch_api(url, retries=3):
+    """Fotmob için retry mekanizmalı fetch"""
+    for attempt in range(retries):
         try:
-            r = await client.get(url)
-            if r.status_code == 200:
-                return r.json()
-            return {}
+            # Fotmob için daha kısa bekleme (daha az agresif)
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            
+            async with httpx.AsyncClient(
+                timeout=30.0, 
+                follow_redirects=True, 
+                headers=HEADERS
+            ) as client:
+                r = await client.get(url)
+                
+                if r.status_code == 200:
+                    return r.json()
+                elif r.status_code == 429:
+                    logger.warning(f"429 rate limit, bekleme: {2 ** attempt}s")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                else:
+                    logger.error(f"HTTP {r.status_code}: {url}")
+                    if attempt == retries - 1:
+                        return {}
+                    
         except Exception as e:
-            logger.error(f"API Hatası ({url}): {e}")
-            return {}
+            logger.error(f"Fetch hatası ({url}): {e}")
+            if attempt == retries - 1:
+                return {}
+            await asyncio.sleep(1)
+    
+    return {}
 
-def get_real_minute(m):
+def get_fotmob_minute(match_data):
+    """Fotmob'dan dakika çıkarımı (farklı yapı)"""
     try:
-        now    = int(time.time())
-        status = m.get("status") or {}
-        stype  = (status.get("type") or "").lower()
-        desc   = (status.get("description") or "").lower()
-
-        if stype in ("finished", "ended"):
+        status = match_data.get("status", {})
+        minute = status.get("minute", 0)
+        added_time = status.get("addedTime", 0)
+        
+        if status.get("finished", False):
             return "MS"
-        if stype in ("notstarted", "scheduled"):
+        if status.get("halfTimeBreak", False) or status.get("minute") == 45 and status.get("halfTime"):
+            return "İY"
+        if not status.get("started", False):
             return "0'"
-        if stype in ("halftime", "break", "pause"):
-            return "İY"
-        if any(x in desc for x in ["ht", "half-time", "halftime", "interval"]):
-            return "İY"
-
-        time_obj = m.get("time") or {}
-        period = safe_int(time_obj.get("period", 0), 0)
-        if period not in (1, 2):
-            if any(x in desc for x in ["2nd", "second", "2. yar", "ikinci"]):
-                period = 2
-            elif any(x in desc for x in ["1st", "first", "1. yar", "birinci"]):
-                period = 1
-            else:
-                period = 0
-
-        start_ts = normalize_ts(m.get("startTimestamp"))
-        diff_start = (((now - start_ts) // 60) + 1) if start_ts else None
-
-        if diff_start is not None:
-            if diff_start >= 55 and period in (0, 1):
-                period = 2
-            elif diff_start < 50 and period == 2:
-                period = 1
-
-        cps = normalize_ts(
-            time_obj.get("currentPeriodStartTimestamp")
-            or m.get("currentPeriodStartTimestamp")
-        )
-
-        if cps and period in (1, 2):
-            elapsed_period = max(0, ((now - cps) // 60) + 1)
-            minute = (period - 1) * 45 + elapsed_period
+            
+        # Dakika hesaplama (45+2 gibi)
+        if added_time and minute >= 45:
+            return f"{minute}+{added_time}'"
+        elif minute > 90:
+            return f"90+{minute-90}'"
         else:
-            elapsed = safe_int(status.get("elapsed", 0), 0)
-            if elapsed <= 0 and diff_start is not None:
-                elapsed = diff_start
-            minute = elapsed
-
-            if period == 2 and minute <= 45 and (diff_start is None or diff_start >= 55):
-                minute += 45
-
-        minute = max(1, min(130, int(minute)))
-        return f"{minute}'"
+            return f"{minute}'"
     except:
         return "0'"
 
+def should_check_match(match, sent_ids):
+    """Fotmob formatına göre filtreleme"""
+    try:
+        mid = str(match.get("id", ""))
+        minute_str = get_fotmob_minute(match)
+        
+        if mid in sent_ids:
+            return False, "Zaten gönderildi"
+        if minute_str in ("İY", "MS", "0'"):
+            return False, f"Geçersiz dakika: {minute_str}"
+            
+        # Dakika sayısal kontrol
+        minute_num = safe_int(minute_str.replace("'", "").split("+")[0], 0)
+        if not (20 <= minute_num <= 85):
+            return False, f"Dakika dışı: {minute_num}"
+            
+        # Skor kontrolü (Fotmob formatı farklı)
+        home_score = safe_int(match.get("home", {}).get("score", 0))
+        away_score = safe_int(match.get("away", {}).get("score", 0))
+        if home_score + away_score > 4:
+            return False, f"Çok gollü: {home_score + away_score}"
+            
+        # Lig kontrolü (Fotmob'da league var mı?)
+        if not match.get("leagueName") and not match.get("tournamentName"):
+            # Bazen league objesi içinde olur
+            if not match.get("league", {}).get("name"):
+                return False, "Lig bilgisi yok"
+            
+        return True, minute_num
+    except Exception as e:
+        return False, f"Filtre hatası: {e}"
+
+async def get_match_stats(match_id):
+    """Fotmob'dan detaylı istatistik çekme (Yapı farklı)"""
+    url = MATCH_URL.format(match_id)
+    data = await fetch_api(url)
+    
+    if not data or not data.get("content"):
+        return None
+        
+    try:
+        content = data["content"]
+        
+        # Varsayılan stats objesi (Sofascore ile aynı key'lerde olmalı brain uyumlu olsun)
+        stats = {
+            'home_sot': 0,       'away_sot': 0,
+            'home_shots': 0,     'away_shots': 0,
+            'home_corners': 0,   'away_corners': 0,
+            'home_poss': 50,     'away_poss': 50,
+            'home_xg': 0.0,      'away_xg': 0.0,
+            'home_attacks': 0,   'away_attacks': 0,
+            'home_dangerous': 0, 'away_dangerous': 0,
+            'home_saves': 0,     'away_saves': 0,
+            'home_big_chances': 0, 'away_big_chances': 0,
+            'has': False
+        }
+        
+        # İstatistikleri bul (Fotmob'da periods içinde)
+        stats_periods = content.get("stats", {}).get("periods", [])
+        if not stats_periods:
+            return None
+            
+        # Genelde periods[0] = İlk Yarı, periods[1] = İkinci Yarı, periods[2] = Toplam (All)
+        # Toplam istatistikleri alalım (All veya son period)
+        target_period = None
+        for period in stats_periods:
+            if period.get("period") == "ALL" or period.get("period") == "FullMatch":
+                target_period = period
+                break
+        
+        # ALL yoksa son periodu al
+        if not target_period and len(stats_periods) > 0:
+            target_period = stats_periods[-1]
+            
+        if not target_period:
+            return None
+            
+        # İstatistikleri parse et
+        period_stats = target_period.get("stats", [])
+        
+        for stat_group in period_stats:
+            group_title = stat_group.get("title", "").lower()
+            items = stat_group.get("stats", [])
+            
+            for item in items:
+                key = item.get("key", "").lower()
+                title = item.get("title", "").lower()
+                home_val = item.get("homeValue", 0) or 0
+                away_val = item.get("awayValue", 0) or 0
+                
+                # Map Fotmob keys to Sofascore-like keys
+                if key in ["shots_on_target", "sot", "shotson"]:
+                    stats['home_sot'] = safe_int(home_val)
+                    stats['away_sot'] = safe_int(away_val)
+                    stats['has'] = True
+                elif key in ["total_shots", "shots", "attempts"]:
+                    stats['home_shots'] = safe_int(home_val)
+                    stats['away_shots'] = safe_int(away_val)
+                    stats['has'] = True
+                elif key in ["corners", "corner_kicks"]:
+                    stats['home_corners'] = safe_int(home_val)
+                    stats['away_corners'] = safe_int(away_val)
+                elif key in ["possession", "ball_possession", "poss"]:
+                    stats['home_poss'] = safe_int(home_val, 50)
+                    stats['away_poss'] = safe_int(away_val, 50)
+                elif key in ["saves", "goalkeeper_saves"]:
+                    stats['home_saves'] = safe_int(home_val)
+                    stats['away_saves'] = safe_int(away_val)
+                elif key in ["big_chances", "bigchances"]:
+                    stats['home_big_chances'] = safe_int(home_val)
+                    stats['away_big_chances'] = safe_int(away_val)
+                elif key in ["dangerous_attacks", "dangerousattacks"]:
+                    stats['home_dangerous'] = safe_int(home_val)
+                    stats['away_dangerous'] = safe_int(away_val)
+                    
+        # xG verisi (Fotmob'da shotmap içinde veya ayrı)
+        shotmap = content.get("shotmap", [])
+        if shotmap:
+            home_xg = sum(safe_float(shot.get("expectedGoals", 0)) for shot in shotmap if shot.get("teamId") == content.get("matchFacts", {}).get("homeTeam", {}).get("id"))
+            away_xg = sum(safe_float(shot.get("expectedGoals", 0)) for shot in shotmap if shot.get("teamId") == content.get("matchFacts", {}).get("awayTeam", {}).get("id"))
+            stats['home_xg'] = round(home_xg, 2)
+            stats['away_xg'] = round(away_xg, 2)
+        else:
+            # Alternatif xG location
+            stats['home_xg'] = safe_float(content.get("matchFacts", {}).get("homeTeam", {}).get("expectedGoals"), 0.0)
+            stats['away_xg'] = safe_float(content.get("matchFacts", {}).get("awayTeam", {}).get("expectedGoals"), 0.0)
+            
+        # Dakika bilgisi (stats içinde minute varsa)
+        minute = 0
+        match_status = content.get("matchFacts", {}).get("matchStatus", {})
+        if match_status:
+            minute = safe_int(match_status.get("minute"), 0)
+        stats['minute_int'] = minute
+        stats['minute_str'] = str(minute) + "'"
+        
+        return stats if stats['has'] else None
+        
+    except Exception as e:
+        logger.error(f"Stats parse hatası ({match_id}): {e}")
+        return None
+
 async def manage_history(mode="read", data=None):
+    """Gist yönetimi (aynı)"""
     url = f"https://api.github.com/gists/{GIST_ID}"
     async with gist_lock:
         async with httpx.AsyncClient(timeout=20.0, headers=GIST_HEADERS) as client:
@@ -185,112 +294,8 @@ async def manage_history(mode="read", data=None):
                 logger.error(f"Gist hatası: {e}")
                 return [] if mode == "read" else None
 
-async def get_stats(match_id):
-    stats_url = STATS_URL.format(match_id)
-    match_url = MATCH_URL.format(match_id)
-
-    s = {
-        'home_sot': 0,       'away_sot': 0,
-        'home_shots': 0,     'away_shots': 0,
-        'home_corners': 0,   'away_corners': 0,
-        'home_poss': 50,     'away_poss': 50,
-        'home_xg': 0.0,      'away_xg': 0.0,
-        'home_attacks': 0,   'away_attacks': 0,
-        'home_dangerous': 0, 'away_dangerous': 0,
-        'home_saves': 0,     'away_saves': 0,
-        'home_big_chances': 0, 'away_big_chances': 0,
-        'home_shots_box': 0, 'away_shots_box': 0,
-        'has': False
-    }
-
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=HEADERS) as client:
-        try:
-            stats_resp, match_resp = await asyncio.gather(
-                client.get(stats_url),
-                client.get(match_url),
-                return_exceptions=True
-            )
-        except Exception as e:
-            logger.error(f"Paralel istek hatası ({match_id}): {e}")
-            return None
-
-    try:
-        if (not isinstance(stats_resp, Exception) and stats_resp.status_code == 200):
-            data = stats_resp.json()
-            for p in data.get('statistics', []):
-                if p.get('period') != 'ALL':
-                    continue
-                for g in p.get('groups', []):
-                    for i in g.get('statisticsItems', []):
-                        n  = i.get('name', '')
-                        hv = safe_int(i.get('homeValue', 0))
-                        av = safe_int(i.get('awayValue', 0))
-                        if n == 'Shots on target':
-                            s['home_sot'], s['away_sot'] = hv, av
-                            s['has'] = True
-                        elif n == 'Total shots':
-                            s['home_shots'], s['away_shots'] = hv, av
-                            s['has'] = True
-                        elif n == 'Corner kicks':
-                            s['home_corners'], s['away_corners'] = hv, av
-                        elif n == 'Ball possession':
-                            s['home_poss'], s['away_poss'] = hv, av
-                        elif n == 'Goalkeeper saves':
-                            s['home_saves'], s['away_saves'] = hv, av
-                        elif n == 'Attacks':
-                            s['home_attacks'], s['away_attacks'] = hv, av
-                        elif n == 'Dangerous attacks':
-                            s['home_dangerous'], s['away_dangerous'] = hv, av
-                        elif n == 'Big chances':
-                            s['home_big_chances'], s['away_big_chances'] = hv, av
-                        elif n in ('Shots inside box', 'Shots on box'):
-                            s['home_shots_box'], s['away_shots_box'] = hv, av
-    except Exception as e:
-        logger.error(f"Stats parse ({match_id}): {e}")
-
-    try:
-        if (not isinstance(match_resp, Exception) and match_resp.status_code == 200):
-            ev      = match_resp.json().get('event', {})
-            minute_str = get_real_minute(ev)
-            s["minute_str"] = minute_str
-            s["minute_int"] = safe_int(str(minute_str).replace("'", ""), 0)        
-            home_xg = ev.get('homeXg')
-            away_xg = ev.get('awayXg')
-            if home_xg is not None:
-                s['home_xg'] = round(safe_float(home_xg), 2)
-            if away_xg is not None:
-                s['away_xg'] = round(safe_float(away_xg), 2)
-    except Exception as e:
-        logger.error(f"Match parse ({match_id}): {e}")
-
-    return s if s['has'] else None
-
-def should_check_match(m, sent_ids):
-    try:
-        mid        = str(m.get('id', ''))
-        minute_str = get_real_minute(m)
-
-        if mid in sent_ids:
-            return False, "Zaten gönderildi"
-        if minute_str in ("İY", "MS", "0'"):
-            return False, f"Geçersiz dakika: {minute_str}"
-
-        mn_int = minute_str_to_int(minute_str)
-        if not (10 < mn_int < 85):
-            return False, f"Dakika dışı: {mn_int}"
-        if not m.get('tournament'):
-            return False, "Turnuva bilgisi yok"
-
-        h_s = safe_int(m.get('homeScore', {}).get('current', 0))
-        a_s = safe_int(m.get('awayScore', {}).get('current', 0))
-        if h_s + a_s > 4:
-            return False, f"Çok gollü: {h_s + a_s}"
-
-        return True, mn_int
-    except Exception as e:
-        return False, f"Filtre hatası: {e}"
-
 async def get_ai_insight(home, away, stats, pick, pressure, minute, score, xg=0.0, pick_type="ust"):
+    """AI yorum (aynı)"""
     if not GROQ_KEY:
         return _fallback_comment(home, stats, pick, pressure, pick_type)
 
@@ -313,22 +318,18 @@ async def get_ai_insight(home, away, stats, pick, pressure, minute, score, xg=0.
     h_danger = safe_int(stats.get("home_dangerous", 0))
     h_poss = safe_int(stats.get("home_poss", 50))
     
-    # Daha net ve uzun prompt (150 karakter için)
     prompt = f"""Profesyonel spor analisti. 2 kısa cümle, maksimum 150 karakter.
-
 MAÇ: {home} vs {away} | {minute}' | {score}
 BAHİS: {pick}
 VERİ: {h_sot} isabetli şut, %{h_poss} baskı, {h_danger} tehlikeli atak.
-
-KURAL: Tam 2 cümle yaz. Kesin ve teknik dil kullan. Emoji kullanma.
-
+KURAL: Tam 2 cümle. Kesin dil, emoji yok.
 ANALİZ:"""
 
     payload = {
         "model": "llama-3.1-8b-instant",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
-        "max_tokens": 150  # 60'dan 150'ye çıkarıldı! (Yaklaşık 100-120 karakter)
+        "max_tokens": 300
     }
 
     for attempt in range(3):
@@ -344,15 +345,11 @@ ANALİZ:"""
                                .replace('[', '').replace(']', '').replace('"', '')
                                .replace("'", "").strip())
                     
-                    # 150 karakteri geçerse kısalt ama ... ile bitir
                     if len(clean) > 150:
                         clean = clean[:147] + "..."
-                    
-                    # Çok kısa olursa fallback kullan
                     if len(clean) < 20:
                         return _fallback_comment(home, stats, pick, pressure, pick_type)
                     
-                    logger.info(f"AI → {clean[:80]}...")
                     return clean
                 elif r.status_code == 429:
                     await asyncio.sleep(6 * (attempt + 1))
@@ -364,14 +361,13 @@ ANALİZ:"""
 
     return _fallback_comment(home, stats, pick, pressure, pick_type)
 
-
 def _fallback_comment(home, stats, pick, pressure, pick_type="ust"):
     import random
     h_sot = safe_int(stats.get('home_sot', 0))
     templates = {
-        'iy': [f"{h_sot} şutla baskı kuruluyor. Gol yakın.", f"İlk yarı temposu yüksek."],
-        'ms': [f"Baskı ve şut istatistikleri üst için uygun.", f"Maçın ikinci yarısında üstünlük devam ediyor."],
-        'kg': [f"İki taraf da açık oynuyor. KG potansiyeli var.", f"Karşılıklı ataklar mevcut."],
+        'iy': [f"{h_sot} isabetli şutla baskı kuruluyor. Gol yakın.", f"İlk yarı temposu yüksek."],
+        'ms': [f"Maçın ikinci yarısında baskı sürüyor. Gol potansiyeli var.", f"İstatistikler üst bahisini destekliyor."],
+        'kg': [f"İki taraf da açık oynuyor. Karşılıklı gol olabilir.", f"Defans zafiyetleri KG ihtimalini artırıyor."],
         'default': [f"İstatistiksel veriler {pick} lehine.", f"Baskı skoru ({pressure}%) destekliyor."]
     }
     category = pick_type if pick_type in templates else 'default'
@@ -387,40 +383,38 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    
+    # Fotmob canlı verisi
     data = await fetch_api(LIVE_URL)
-    events = data.get("events", [])
-    if not events:
-        await update.message.reply_text("📭 Şu an canlı maç yok.")
+    matches = data.get("matches", []) if data else []
+    
+    if not matches:
+        await update.message.reply_text("📭 Şu an canlı maç yok veya API erişiminde sorun var.")
         return
 
-    sem = asyncio.Semaphore(8)
-    async def fetch_minute_for(mid: str):
-        async with sem:
-            r = await fetch_api(MATCH_URL.format(mid))
-            ev = r.get("event", {}) if isinstance(r, dict) else {}
-            return get_real_minute(ev) if ev else None
-
-    chosen = events[:20]
-    tasks = [fetch_minute_for(str(m.get("id", ""))) for m in chosen]
-    minutes = await asyncio.gather(*tasks, return_exceptions=True)
-
-    lines = ["⚽ <b>CANLI MAÇLAR</b>", ""]
+    lines = ["⚽ <b>CANLI MAÇLAR (Fotmob)</b>", ""]
     shown = 0
-    for m, mn in zip(chosen, minutes):
-        stype = (m.get("status", {}).get("type") or "").lower()
-        if stype in ("finished", "ended", "notstarted", "scheduled"):
+    
+    # İlk 20 maçı göster
+    for match in matches[:20]:
+        try:
+            st = match.get("status", {})
+            if st.get("finished") or not st.get("started"):
+                continue
+                
+            mn = get_fotmob_minute(match)
+            if mn in ("İY", "MS", "0'"):
+                continue
+                
+            h = html.escape(match.get("home", {}).get("name", "?"))
+            a = html.escape(match.get("away", {}).get("name", "?"))
+            sh = safe_int(match.get("home", {}).get("score", 0))
+            sa = safe_int(match.get("away", {}).get("score", 0))
+            
+            lines.append(f"⏱ <code>{mn}</code> | {h} <b>{sh}-{sa}</b> {a}")
+            shown += 1
+        except:
             continue
-        if isinstance(mn, Exception) or not mn:
-            mn = get_real_minute(m)
-        if mn in ("İY", "MS", "0'"):
-            continue
-
-        h = html.escape(m.get("homeTeam", {}).get("name", "?") or "?")
-        a = html.escape(m.get("awayTeam", {}).get("name", "?") or "?")
-        sh = safe_int(m.get("homeScore", {}).get("current", 0))
-        sa = safe_int(m.get("awayScore", {}).get("current", 0))
-        lines.append(f"⏱ <code>{mn}</code> | {h} <b>{sh}-{sa}</b> {a}")
-        shown += 1
 
     if shown == 0:
         await update.message.reply_text("📭 Şu an listelenecek canlı maç yok.")
@@ -430,9 +424,16 @@ async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔎 *Sistem Denetleniyor...*", parse_mode=ParseMode.MARKDOWN)
+    
+    # Fotmob test
     api_data = await fetch_api(LIVE_URL)
     gist_data = await manage_history("read")
-    ai_test = await get_ai_insight("TestA", "TestB", {'home_sot': 3, 'away_sot': 1, 'home_shots': 8, 'away_shots': 3}, "MS 1.5 ÜST", 70, 55, "1-0", 1.2, "ms")
+    
+    # AI test (dummy data)
+    ai_test = await get_ai_insight("TestA", "TestB", 
+        {'home_sot': 3, 'away_sot': 1, 'home_shots': 8, 'away_shots': 3}, 
+        "MS 1.5 ÜST", 70, 55, "1-0", 1.2, "ms")
+    
     delivery = "✅ OK"
     try:
         await context.bot.send_message(chat_id=CHAT_ID, text="🧪 Test")
@@ -441,11 +442,11 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     report = (
         f"🛡 *BOT DENETİM RAPORU*\n\n"
-        f"🌐 API: {'✅ OK' if api_data else '❌ HATA'}\n"
+        f"🌐 Fotmob API: {'✅ OK' if api_data else '❌ HATA'}\n"
         f"💾 Gist: {'✅ OK' if isinstance(gist_data, list) else '❌ HATA'}\n"
         f"🧠 AI: {'✅ OK' if len(ai_test) > 10 else '❌ HATA'}\n"
         f"📩 İletim: {delivery}\n"
-        f"⚽ Canlı Maç: {len(api_data.get('events', []))}\n"
+        f"⚽ Canlı Maç: {len(api_data.get('matches', [])) if api_data else 0}\n"
         f"📊 Kayıtlı Sinyal: {len(gist_data) if isinstance(gist_data, list) else 0}\n\n"
         f"🚀 _Sistem aktif!_"
     )
@@ -461,14 +462,17 @@ async def result_tracker(app):
 
             for sig in history[-20:]:
                 if (sig.get('status') == 'pending' and time.time() - sig.get('timestamp', 0) > 3600):
-                    r = await fetch_api(f"https://www.sofascore.com/api/v1/event/{sig['id']}")
-                    ev = r.get('event', {})
-                    if ev.get('status', {}).get('type') == 'finished':
-                        hs = safe_int(ev.get('homeScore', {}).get('current', 0))
-                        as_ = safe_int(ev.get('awayScore', {}).get('current', 0))
-                        is_win = (hs + as_) > sig.get('start_total', 0)
+                    # Fotmob'dan maç sonucu kontrolü
+                    r = await fetch_api(MATCH_URL.format(sig['id']))
+                    content = r.get("content", {}) if r else {}
+                    status = content.get("matchFacts", {}).get("matchStatus", {})
+                    
+                    if status.get("finished"):
+                        home_score = safe_int(content.get("matchFacts", {}).get("homeTeam", {}).get("score"), 0)
+                        away_score = safe_int(content.get("matchFacts", {}).get("awayTeam", {}).get("score"), 0)
+                        is_win = (home_score + away_score) > sig.get('start_total', 0)
                         sig['status'] = 'WIN ✅' if is_win else 'LOSS ❌'
-                        sig['final_score'] = f"{hs}-{as_}"
+                        sig['final_score'] = f"{home_score}-{away_score}"
                         updated = True
 
             if updated:
@@ -479,11 +483,11 @@ async def result_tracker(app):
         await asyncio.sleep(600)
 
 async def signal_monitor(app):
-    logger.info("🚀 Sinyal monitörü başladı.")
+    logger.info("🚀 Sinyal monitörü başladı (Fotmob).")
     while True:
         try:
             data = await fetch_api(LIVE_URL)
-            events = data.get('events', [])
+            matches = data.get("matches", []) if data else []
             history = await manage_history("read")
             if not isinstance(history, list):
                 history = []
@@ -491,32 +495,49 @@ async def signal_monitor(app):
             sent_ids = {str(x['id']) for x in history}
             candidates = []
 
-            for m in events:
+            for m in matches:
                 ok, result = should_check_match(m, sent_ids)
                 if ok:
                     candidates.append((m, result))
 
-            logger.info(f"📊 {len(events)} maç → {len(candidates)} aday → {len(history)} sinyal kayıtlı")
+            logger.info(f"📊 {len(matches)} maç → {len(candidates)} aday → {len(history)} sinyal kayıtlı")
 
             for m, mn_int in candidates:
                 try:
                     mid = str(m.get('id', ''))
-                    stats = await get_stats(mid)
-                    if stats and stats.get("minute_int", 0) > 0:
-                        mn_int = stats["minute_int"]
-
-                    if not stats or not stats.get('has'):
+                    stats = await get_match_stats(mid)
+                    
+                    if not stats:
+                        logger.info(f"⏭ {mid} için istatistik yok")
                         continue
 
-                    res = brain.analyze_advanced(m, stats, mn_int)
+                    # Fotmob formatından skorları çıkar
+                    home_score = safe_int(m.get('home', {}).get('score', 0))
+                    away_score = safe_int(m.get('away', {}).get('score', 0))
+                    
+                    # Brain için maç objesini hazırla (Sofascore formatına benzer)
+                    match_obj = {
+                        'id': mid,
+                        'homeTeam': {'name': m.get('home', {}).get('name', '?')},
+                        'awayTeam': {'name': m.get('away', {}).get('name', '?')},
+                        'homeScore': {'current': home_score},
+                        'awayScore': {'current': away_score},
+                        'tournament': {'name': m.get('leagueName', m.get('tournamentName', 'Bilinmiyor'))}
+                    }
+                    
+                    # Dakika için minute_int kullan (stats'tan gelen veya hesaplanan)
+                    if stats.get('minute_int', 0) > 0:
+                        mn_int = stats['minute_int']
+
+                    res = brain.analyze_advanced(match_obj, stats, mn_int)
 
                     if not res.get('is_signal'):
                         logger.info(f"⏭ {res.get('reason', '?')}")
                         continue
 
-                    home_name = m.get('homeTeam', {}).get('name', '?')
-                    away_name = m.get('awayTeam', {}).get('name', '?')
-                    league = m.get('tournament', {}).get('name', 'Bilinmiyor')
+                    home_name = match_obj['homeTeam']['name']
+                    away_name = match_obj['awayTeam']['name']
+                    league = match_obj['tournament']['name']
                     xg_val = res.get('xg', 0.0)
                     momentum = res.get('momentum', 0)
                     pick_type = res.get('pick_type', 'ust')
@@ -534,7 +555,6 @@ async def signal_monitor(app):
                     if alt_picks:
                         alt_lines = []
                         for p in alt_picks[:2]:
-                            # p = (name, odds, risk, type)
                             bet_name = p[0]
                             alt_lines.append(f"  - {bet_name}")
                         if alt_lines:
@@ -542,7 +562,6 @@ async def signal_monitor(app):
 
                     period_emoji = "2️⃣" if res['period'] == "2. YARI" else "1️⃣"
                     
-                    # İstatistikleri hazırla
                     h_sot = stats.get('home_sot', 0)
                     a_sot = stats.get('away_sot', 0)
                     h_shots = stats.get('home_shots', 0)
@@ -556,7 +575,6 @@ async def signal_monitor(app):
                     h_saves = stats.get('home_saves', 0)
                     a_saves = stats.get('away_saves', 0)
 
-                    # YENİ FORMAT
                     txt = (
                         f"📡 *SİNYAL*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -582,11 +600,7 @@ async def signal_monitor(app):
                         f"💎 *VIP Pro Trader*"
                     )
 
-                    await app.bot.send_message(
-                        chat_id=CHAT_ID, 
-                        text=txt, 
-                        parse_mode=ParseMode.MARKDOWN
-                    )
+                    await app.bot.send_message(chat_id=CHAT_ID, text=txt, parse_mode=ParseMode.MARKDOWN)
                     
                     history.append({
                         "id": mid,
@@ -602,14 +616,14 @@ async def signal_monitor(app):
                     await asyncio.sleep(2)
 
                 except Exception as e:
-                    logger.error(f"Maç hatası ({m.get('id','')}): {e}")
+                    logger.error(f"Maç hatası: {e}")
                     continue
 
         except Exception as e:
             logger.error(f"Monitör hatası: {e}")
 
         await asyncio.sleep(180)
-        
+
 async def post_init(app):
     asyncio.create_task(result_tracker(app))
     asyncio.create_task(signal_monitor(app))
