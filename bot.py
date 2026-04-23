@@ -1,5 +1,6 @@
 import os, asyncio, json, time, logging
 import html
+import httpx
 from telegram.constants import ChatAction
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
