@@ -25,7 +25,7 @@ GROQ_KEY     = os.getenv("GROQ_API_KEY")
 brain     = BettingBrain()
 gist_lock = asyncio.Lock()
 
-# Fotmob Headers (Daha hafif koruma)
+# FOTMOB Headers (Basit ama yeterli)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -40,8 +40,7 @@ GIST_HEADERS = {
     "Accept":        "application/vnd.github.v3+json"
 }
 
-# Fotmob API URL'leri
-LIVE_URL  = "https://www.fotmob.com/api/live"
+# FOTMOB URL'ler
 MATCH_URL = "https://www.fotmob.com/api/matchDetails?matchId={}"
 
 last_ai_requests  = []
@@ -62,23 +61,11 @@ def safe_float(val, default=0.0):
         return float(str(val).replace('%', '').strip())
     except:
         return default
-        
-def normalize_ts(ts):
-    try:
-        if ts is None:
-            return None
-        ts = int(ts)
-        if ts > 10_000_000_000:
-            ts //= 1000
-        return ts
-    except:
-        return None        
 
 async def fetch_api(url, retries=3):
     """Fotmob için retry mekanizmalı fetch"""
     for attempt in range(retries):
         try:
-            # Fotmob için daha kısa bekleme (daha az agresif)
             await asyncio.sleep(random.uniform(0.5, 1.5))
             
             async with httpx.AsyncClient(
@@ -96,8 +83,9 @@ async def fetch_api(url, retries=3):
                     continue
                 else:
                     logger.error(f"HTTP {r.status_code}: {url}")
-                    if attempt == retries - 1:
-                        return {}
+                    if attempt < retries - 1:
+                        continue
+                    return {}
                     
         except Exception as e:
             logger.error(f"Fetch hatası ({url}): {e}")
@@ -107,27 +95,39 @@ async def fetch_api(url, retries=3):
     
     return {}
 
+def get_live_matches(data):
+    """Fotmob'dan canlı maçları filtrele"""
+    if not data:
+        return []
+    
+    matches = []
+    leagues = data.get("leagues", [])
+    
+    for league in leagues:
+        league_matches = league.get("matches", [])
+        for match in league_matches:
+            status = match.get("status", {})
+            # Sadece canlı ve başlamış maçlar
+            if status.get("started") and not status.get("finished"):
+                match["leagueName"] = league.get("name", "Bilinmiyor")
+                matches.append(match)
+    
+    return matches
+
 def get_fotmob_minute(match_data):
-    """Fotmob'dan dakika çıkarımı (farklı yapı)"""
+    """Fotmob'dan dakika çıkarımı"""
     try:
         status = match_data.get("status", {})
-        minute = status.get("minute", 0)
-        added_time = status.get("addedTime", 0)
+        minute = safe_int(status.get("minute"), 0)
         
-        if status.get("finished", False):
+        if status.get("finished"):
             return "MS"
-        if status.get("halfTimeBreak", False) or status.get("minute") == 45 and status.get("halfTime"):
+        if status.get("halfTimeBreak"):
             return "İY"
-        if not status.get("started", False):
+        if not status.get("started"):
             return "0'"
             
-        # Dakika hesaplama (45+2 gibi)
-        if added_time and minute >= 45:
-            return f"{minute}+{added_time}'"
-        elif minute > 90:
-            return f"90+{minute-90}'"
-        else:
-            return f"{minute}'"
+        return f"{minute}'"
     except:
         return "0'"
 
@@ -142,29 +142,25 @@ def should_check_match(match, sent_ids):
         if minute_str in ("İY", "MS", "0'"):
             return False, f"Geçersiz dakika: {minute_str}"
             
-        # Dakika sayısal kontrol
-        minute_num = safe_int(minute_str.replace("'", "").split("+")[0], 0)
+        minute_num = safe_int(minute_str.replace("'", ""), 0)
         if not (20 <= minute_num <= 85):
             return False, f"Dakika dışı: {minute_num}"
             
-        # Skor kontrolü (Fotmob formatı farklı)
-        home_score = safe_int(match.get("home", {}).get("score", 0))
-        away_score = safe_int(match.get("away", {}).get("score", 0))
+        home_score = safe_int(match.get("home", {}).get("score"), 0)
+        away_score = safe_int(match.get("away", {}).get("score"), 0)
+        
         if home_score + away_score > 4:
             return False, f"Çok gollü: {home_score + away_score}"
             
-        # Lig kontrolü (Fotmob'da league var mı?)
-        if not match.get("leagueName") and not match.get("tournamentName"):
-            # Bazen league objesi içinde olur
-            if not match.get("league", {}).get("name"):
-                return False, "Lig bilgisi yok"
+        if not match.get("leagueName"):
+            return False, "Lig bilgisi yok"
             
         return True, minute_num
     except Exception as e:
         return False, f"Filtre hatası: {e}"
 
 async def get_match_stats(match_id):
-    """Fotmob'dan detaylı istatistik çekme (Yapı farklı)"""
+    """Fotmob'dan detaylı istatistik çekme"""
     url = MATCH_URL.format(match_id)
     data = await fetch_api(url)
     
@@ -173,8 +169,6 @@ async def get_match_stats(match_id):
         
     try:
         content = data["content"]
-        
-        # Varsayılan stats objesi (Sofascore ile aynı key'lerde olmalı brain uyumlu olsun)
         stats = {
             'home_sot': 0,       'away_sot': 0,
             'home_shots': 0,     'away_shots': 0,
@@ -188,84 +182,95 @@ async def get_match_stats(match_id):
             'has': False
         }
         
-        # İstatistikleri bul (Fotmob'da periods içinde)
-        stats_periods = content.get("stats", {}).get("periods", [])
-        if not stats_periods:
+        # Maç durumu
+        match_facts = content.get("matchFacts", {})
+        match_status = match_facts.get("matchStatus", {})
+        minute = safe_int(match_status.get("minute"), 0)
+        stats['minute_int'] = minute
+        stats['minute_str'] = f"{minute}'" if minute > 0 else "0'"
+        
+        # İstatistikler
+        stats_data = content.get("stats", {})
+        periods = stats_data.get("periods", [])
+        
+        if not periods:
             return None
             
-        # Genelde periods[0] = İlk Yarı, periods[1] = İkinci Yarı, periods[2] = Toplam (All)
-        # Toplam istatistikleri alalım (All veya son period)
+        # Toplam istatistikleri al (son period veya "All")
         target_period = None
-        for period in stats_periods:
-            if period.get("period") == "ALL" or period.get("period") == "FullMatch":
+        for period in periods:
+            if period.get("period") in ["ALL", "FullMatch", "MatchTotal"]:
                 target_period = period
                 break
         
-        # ALL yoksa son periodu al
-        if not target_period and len(stats_periods) > 0:
-            target_period = stats_periods[-1]
+        if not target_period and periods:
+            target_period = periods[-1]
             
         if not target_period:
             return None
             
-        # İstatistikleri parse et
-        period_stats = target_period.get("stats", [])
-        
-        for stat_group in period_stats:
-            group_title = stat_group.get("title", "").lower()
-            items = stat_group.get("stats", [])
-            
-            for item in items:
-                key = item.get("key", "").lower()
-                title = item.get("title", "").lower()
-                home_val = item.get("homeValue", 0) or 0
-                away_val = item.get("awayValue", 0) or 0
+        # Stats parse et
+        stats_list = target_period.get("stats", [])
+        for stat_group in stats_list:
+            if not isinstance(stat_group, dict):
+                continue
                 
-                # Map Fotmob keys to Sofascore-like keys
-                if key in ["shots_on_target", "sot", "shotson"]:
+            items = stat_group.get("stats", [])
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                    
+                key = item.get("key", "").lower()
+                home_val = item.get("home") or item.get("homeValue") or 0
+                away_val = item.get("away") or item.get("awayValue") or 0
+                
+                if key in ["shots_on_target", "sot", "shotson", "shots_on"]:
                     stats['home_sot'] = safe_int(home_val)
                     stats['away_sot'] = safe_int(away_val)
                     stats['has'] = True
-                elif key in ["total_shots", "shots", "attempts"]:
+                elif key in ["total_shots", "shots", "attempts", "totalshots"]:
                     stats['home_shots'] = safe_int(home_val)
                     stats['away_shots'] = safe_int(away_val)
                     stats['has'] = True
-                elif key in ["corners", "corner_kicks"]:
+                elif key in ["corners", "corner_kicks", "cornerkicks"]:
                     stats['home_corners'] = safe_int(home_val)
                     stats['away_corners'] = safe_int(away_val)
-                elif key in ["possession", "ball_possession", "poss"]:
+                elif key in ["possession", "poss", "ball_possession"]:
                     stats['home_poss'] = safe_int(home_val, 50)
                     stats['away_poss'] = safe_int(away_val, 50)
                 elif key in ["saves", "goalkeeper_saves"]:
                     stats['home_saves'] = safe_int(home_val)
                     stats['away_saves'] = safe_int(away_val)
-                elif key in ["big_chances", "bigchances"]:
+                elif key in ["big_chances", "bigchances", "big_chance"]:
                     stats['home_big_chances'] = safe_int(home_val)
                     stats['away_big_chances'] = safe_int(away_val)
                 elif key in ["dangerous_attacks", "dangerousattacks"]:
                     stats['home_dangerous'] = safe_int(home_val)
                     stats['away_dangerous'] = safe_int(away_val)
-                    
-        # xG verisi (Fotmob'da shotmap içinde veya ayrı)
+        
+        # xG Hesapla
         shotmap = content.get("shotmap", [])
         if shotmap:
-            home_xg = sum(safe_float(shot.get("expectedGoals", 0)) for shot in shotmap if shot.get("teamId") == content.get("matchFacts", {}).get("homeTeam", {}).get("id"))
-            away_xg = sum(safe_float(shot.get("expectedGoals", 0)) for shot in shotmap if shot.get("teamId") == content.get("matchFacts", {}).get("awayTeam", {}).get("id"))
+            home_team_id = match_facts.get("homeTeam", {}).get("id")
+            away_team_id = match_facts.get("awayTeam", {}).get("id")
+            
+            home_xg = sum(safe_float(shot.get("expectedGoals"), 0) 
+                         for shot in shotmap 
+                         if shot.get("teamId") == home_team_id)
+            away_xg = sum(safe_float(shot.get("expectedGoals"), 0) 
+                         for shot in shotmap 
+                         if shot.get("teamId") == away_team_id)
+            
             stats['home_xg'] = round(home_xg, 2)
             stats['away_xg'] = round(away_xg, 2)
         else:
-            # Alternatif xG location
-            stats['home_xg'] = safe_float(content.get("matchFacts", {}).get("homeTeam", {}).get("expectedGoals"), 0.0)
-            stats['away_xg'] = safe_float(content.get("matchFacts", {}).get("awayTeam", {}).get("expectedGoals"), 0.0)
-            
-        # Dakika bilgisi (stats içinde minute varsa)
-        minute = 0
-        match_status = content.get("matchFacts", {}).get("matchStatus", {})
-        if match_status:
-            minute = safe_int(match_status.get("minute"), 0)
-        stats['minute_int'] = minute
-        stats['minute_str'] = str(minute) + "'"
-        
+            home_xg_val = match_facts.get("homeTeam", {}).get("expectedGoals")
+            away_xg_val = match_facts.get("awayTeam", {}).get("expectedGoals")
+            if home_xg_val is not None:
+                stats['home_xg'] = safe_float(home_xg_val, 0.0)
+            if away_xg_val is not None:
+                stats['away_xg'] = safe_float(away_xg_val, 0.0)
+                    
         return stats if stats['has'] else None
         
     except Exception as e:
@@ -273,7 +278,7 @@ async def get_match_stats(match_id):
         return None
 
 async def manage_history(mode="read", data=None):
-    """Gist yönetimi (aynı)"""
+    """Gist yönetimi"""
     url = f"https://api.github.com/gists/{GIST_ID}"
     async with gist_lock:
         async with httpx.AsyncClient(timeout=20.0, headers=GIST_HEADERS) as client:
@@ -295,7 +300,7 @@ async def manage_history(mode="read", data=None):
                 return [] if mode == "read" else None
 
 async def get_ai_insight(home, away, stats, pick, pressure, minute, score, xg=0.0, pick_type="ust"):
-    """AI yorum (aynı)"""
+    """AI yorum"""
     if not GROQ_KEY:
         return _fallback_comment(home, stats, pick, pressure, pick_type)
 
@@ -350,6 +355,7 @@ ANALİZ:"""
                     if len(clean) < 20:
                         return _fallback_comment(home, stats, pick, pressure, pick_type)
                     
+                    logger.info(f"AI → {clean[:60]}...")
                     return clean
                 elif r.status_code == 429:
                     await asyncio.sleep(6 * (attempt + 1))
@@ -384,32 +390,29 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     
-    # Fotmob canlı verisi
-    data = await fetch_api(LIVE_URL)
-    matches = data.get("matches", []) if data else []
+    current_date = datetime.now().strftime("%Y%m%d")
+    live_url = f"https://www.fotmob.com/api/matches?date={current_date}"
+    
+    data = await fetch_api(live_url)
+    matches = get_live_matches(data)
     
     if not matches:
-        await update.message.reply_text("📭 Şu an canlı maç yok veya API erişiminde sorun var.")
+        await update.message.reply_text("📭 Şu an canlı maç yok.")
         return
 
-    lines = ["⚽ <b>CANLI MAÇLAR (Fotmob)</b>", ""]
+    lines = ["⚽ <b>CANLI MAÇLAR</b>", ""]
     shown = 0
     
-    # İlk 20 maçı göster
     for match in matches[:20]:
         try:
-            st = match.get("status", {})
-            if st.get("finished") or not st.get("started"):
-                continue
-                
             mn = get_fotmob_minute(match)
             if mn in ("İY", "MS", "0'"):
                 continue
                 
             h = html.escape(match.get("home", {}).get("name", "?"))
             a = html.escape(match.get("away", {}).get("name", "?"))
-            sh = safe_int(match.get("home", {}).get("score", 0))
-            sa = safe_int(match.get("away", {}).get("score", 0))
+            sh = safe_int(match.get("home", {}).get("score"), 0)
+            sa = safe_int(match.get("away", {}).get("score"), 0)
             
             lines.append(f"⏱ <code>{mn}</code> | {h} <b>{sh}-{sa}</b> {a}")
             shown += 1
@@ -425,11 +428,13 @@ async def live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔎 *Sistem Denetleniyor...*", parse_mode=ParseMode.MARKDOWN)
     
-    # Fotmob test
-    api_data = await fetch_api(LIVE_URL)
+    current_date = datetime.now().strftime("%Y%m%d")
+    live_url = f"https://www.fotmob.com/api/matches?date={current_date}"
+    
+    api_data = await fetch_api(live_url)
+    matches = get_live_matches(api_data) if api_data else []
     gist_data = await manage_history("read")
     
-    # AI test (dummy data)
     ai_test = await get_ai_insight("TestA", "TestB", 
         {'home_sot': 3, 'away_sot': 1, 'home_shots': 8, 'away_shots': 3}, 
         "MS 1.5 ÜST", 70, 55, "1-0", 1.2, "ms")
@@ -442,11 +447,11 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     report = (
         f"🛡 *BOT DENETİM RAPORU*\n\n"
-        f"🌐 Fotmob API: {'✅ OK' if api_data else '❌ HATA'}\n"
+        f"🌐 Fotmob API: {'✅ OK' if matches else '❌ HATA'}\n"
         f"💾 Gist: {'✅ OK' if isinstance(gist_data, list) else '❌ HATA'}\n"
         f"🧠 AI: {'✅ OK' if len(ai_test) > 10 else '❌ HATA'}\n"
         f"📩 İletim: {delivery}\n"
-        f"⚽ Canlı Maç: {len(api_data.get('matches', [])) if api_data else 0}\n"
+        f"⚽ Canlı Maç: {len(matches)}\n"
         f"📊 Kayıtlı Sinyal: {len(gist_data) if isinstance(gist_data, list) else 0}\n\n"
         f"🚀 _Sistem aktif!_"
     )
@@ -462,7 +467,6 @@ async def result_tracker(app):
 
             for sig in history[-20:]:
                 if (sig.get('status') == 'pending' and time.time() - sig.get('timestamp', 0) > 3600):
-                    # Fotmob'dan maç sonucu kontrolü
                     r = await fetch_api(MATCH_URL.format(sig['id']))
                     content = r.get("content", {}) if r else {}
                     status = content.get("matchFacts", {}).get("matchStatus", {})
@@ -486,8 +490,17 @@ async def signal_monitor(app):
     logger.info("🚀 Sinyal monitörü başladı (Fotmob).")
     while True:
         try:
-            data = await fetch_api(LIVE_URL)
-            matches = data.get("matches", []) if data else []
+            current_date = datetime.now().strftime("%Y%m%d")
+            live_url = f"https://www.fotmob.com/api/matches?date={current_date}"
+            
+            data = await fetch_api(live_url)
+            matches = get_live_matches(data)
+            
+            if not matches:
+                logger.info("Canlı maç bulunamadı")
+                await asyncio.sleep(180)
+                continue
+                
             history = await manage_history("read")
             if not isinstance(history, list):
                 history = []
@@ -500,32 +513,28 @@ async def signal_monitor(app):
                 if ok:
                     candidates.append((m, result))
 
-            logger.info(f"📊 {len(matches)} maç → {len(candidates)} aday → {len(history)} sinyal kayıtlı")
+            logger.info(f"📊 {len(matches)} maç → {len(candidates)} aday")
 
             for m, mn_int in candidates:
                 try:
-                    mid = str(m.get('id', ''))
+                    mid = str(m.get("id", ""))
                     stats = await get_match_stats(mid)
                     
-                    if not stats:
-                        logger.info(f"⏭ {mid} için istatistik yok")
+                    if not stats or not stats.get('has'):
                         continue
 
-                    # Fotmob formatından skorları çıkar
-                    home_score = safe_int(m.get('home', {}).get('score', 0))
-                    away_score = safe_int(m.get('away', {}).get('score', 0))
+                    home_data = m.get("home", {})
+                    away_data = m.get("away", {})
                     
-                    # Brain için maç objesini hazırla (Sofascore formatına benzer)
                     match_obj = {
                         'id': mid,
-                        'homeTeam': {'name': m.get('home', {}).get('name', '?')},
-                        'awayTeam': {'name': m.get('away', {}).get('name', '?')},
-                        'homeScore': {'current': home_score},
-                        'awayScore': {'current': away_score},
-                        'tournament': {'name': m.get('leagueName', m.get('tournamentName', 'Bilinmiyor'))}
+                        'homeTeam': {'name': home_data.get('name', '?')},
+                        'awayTeam': {'name': away_data.get('name', '?')},
+                        'homeScore': {'current': safe_int(home_data.get('score'), 0)},
+                        'awayScore': {'current': safe_int(away_data.get('score'), 0)},
+                        'tournament': {'name': m.get('leagueName', 'Bilinmiyor')}
                     }
                     
-                    # Dakika için minute_int kullan (stats'tan gelen veya hesaplanan)
                     if stats.get('minute_int', 0) > 0:
                         mn_int = stats['minute_int']
 
@@ -539,7 +548,6 @@ async def signal_monitor(app):
                     away_name = match_obj['awayTeam']['name']
                     league = match_obj['tournament']['name']
                     xg_val = res.get('xg', 0.0)
-                    momentum = res.get('momentum', 0)
                     pick_type = res.get('pick_type', 'ust')
 
                     logger.info(f"🔍 Sinyal: {home_name} vs {away_name} | {mn_int}' | {res['pick']}")
@@ -549,7 +557,6 @@ async def signal_monitor(app):
                         res['pressure'], mn_int, res['score'], xg_val, pick_type
                     )
 
-                    # Alternatifleri formatla
                     alt_picks = res.get('alt', [])
                     alt_txt = ""
                     if alt_picks:
